@@ -1,0 +1,52 @@
+{
+  "name": "pitgram",
+  "version": "1.0.0",
+  "description": "Telegram bridge for Pi with remote session management",
+  "author": "Raghav Bali",
+  "license": "MIT",
+  "homepage": "https://github.com/raghavbali/pitgram#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/raghavbali/pitgram.git"
+  },
+  "bugs": {
+    "url": "https://github.com/raghavbali/pitgram/issues"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "telegram",
+    "bot"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --experimental-strip-types --test tests/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "image": "https://raw.githubusercontent.com/raghavbali/pitgram/main/assets/screenshot.png"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}

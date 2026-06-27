@@ -1,0 +1,10 @@
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+export declare function isTelegramPrompt(prompt: string): boolean;
+export declare function sanitizeFileName(name: string): string;
+export declare function guessExtensionFromMime(mimeType: string | undefined, fallback: string): string;
+export declare function guessMediaType(path: string): string | undefined;
+export declare function isImageMimeType(mimeType: string | undefined): boolean;
+export declare function formatTokens(count: number): string;
+export declare function chunkParagraphs(text: string): string[];
+export declare function getConfiguredModels(ctx: ExtensionContext): Promise<any[]>;
+export default function (pi: ExtensionAPI): void;
