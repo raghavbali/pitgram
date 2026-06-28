@@ -8,31 +8,74 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import { ExtensionRunner, SessionManager, type SessionInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
-let activeRunner: ExtensionRunner | undefined;
+let activeRunner: any | undefined;
 
-const originalBindCore = ExtensionRunner.prototype.bindCore;
-ExtensionRunner.prototype.bindCore = function (actions, contextActions, providerActions) {
-	activeRunner = this;
-	return originalBindCore.call(this, actions, contextActions, providerActions);
-};
+function patchExtensionRunnerClass(RunnerClass: any) {
+	if (!RunnerClass || !RunnerClass.prototype) return;
+	if ((RunnerClass.prototype as any).__pitgram_patched) return;
+	(RunnerClass.prototype as any).__pitgram_patched = true;
 
-const originalCreateContext = ExtensionRunner.prototype.createContext;
-ExtensionRunner.prototype.createContext = function () {
-	activeRunner = this;
-	return originalCreateContext.call(this);
-};
+	const origBindCore = RunnerClass.prototype.bindCore;
+	if (typeof origBindCore === "function") {
+		RunnerClass.prototype.bindCore = function (this: any, ...args: any[]) {
+			activeRunner = this;
+			return origBindCore.apply(this, args);
+		};
+	}
 
-const originalCreateCommandContext = ExtensionRunner.prototype.createCommandContext;
-ExtensionRunner.prototype.createCommandContext = function () {
-	activeRunner = this;
-	return originalCreateCommandContext.call(this);
-};
+	const origCreateContext = RunnerClass.prototype.createContext;
+	if (typeof origCreateContext === "function") {
+		RunnerClass.prototype.createContext = function (this: any, ...args: any[]) {
+			activeRunner = this;
+			return origCreateContext.apply(this, args);
+		};
+	}
 
-const originalEmit = ExtensionRunner.prototype.emit;
-(ExtensionRunner.prototype as any).emit = function (this: ExtensionRunner, ...args: any[]) {
-	activeRunner = this;
-	return (originalEmit as any).apply(this, args);
-};
+	const origCreateCommandContext = RunnerClass.prototype.createCommandContext;
+	if (typeof origCreateCommandContext === "function") {
+		RunnerClass.prototype.createCommandContext = function (this: any, ...args: any[]) {
+			activeRunner = this;
+			return origCreateCommandContext.apply(this, args);
+		};
+	}
+
+	const origEmit = RunnerClass.prototype.emit;
+	if (typeof origEmit === "function") {
+		RunnerClass.prototype.emit = function (this: any, ...args: any[]) {
+			activeRunner = this;
+			return origEmit.apply(this, args);
+		};
+	}
+}
+
+// 1. Patch local imported ExtensionRunner
+patchExtensionRunnerClass(ExtensionRunner);
+
+// 2. Patch global/well-known installations of pi-coding-agent
+const potentialModulePaths = [
+	"/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js",
+	"/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js",
+	"/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js",
+	"/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js",
+];
+
+for (const p of potentialModulePaths) {
+	try {
+		if (typeof require !== "undefined") {
+			const mod = require(p);
+			if (mod && mod.ExtensionRunner) patchExtensionRunnerClass(mod.ExtensionRunner);
+		}
+	} catch {}
+}
+
+// 3. Inspect require.cache if available
+if (typeof require !== "undefined" && require.cache) {
+	for (const key of Object.keys(require.cache)) {
+		if (key.includes("pi-coding-agent") && (require.cache[key]?.exports as any)?.ExtensionRunner) {
+			patchExtensionRunnerClass((require.cache[key]!.exports as any).ExtensionRunner);
+		}
+	}
+}
 
 interface TelegramConfig {
 	botToken?: string;
@@ -868,12 +911,12 @@ export default function (pi: ExtensionAPI) {
 						throw new Error("cmdCtx.newSession is not a function in current context");
 					}
 					await cmdCtx.newSession({
-						setup: async (sm) => {
+						setup: async (sm: any) => {
 							if (name) {
 								sm.appendSessionInfo(name);
 							}
 						},
-						withSession: async (newCtx) => {
+						withSession: async (newCtx: any) => {
 							const actualName = name || newCtx.sessionManager.getSessionName() || newCtx.sessionManager.getSessionId();
 							await callTelegram("sendMessage", {
 								chat_id: firstMessage.chat.id,
@@ -914,7 +957,7 @@ export default function (pi: ExtensionAPI) {
 						throw new Error("cmdCtx.switchSession is not a function in current context");
 					}
 					await cmdCtx.switchSession(targetPath, {
-						withSession: async (newCtx) => {
+						withSession: async (newCtx: any) => {
 							const sessionName = newCtx.sessionManager.getSessionName() || basename(targetPath);
 							await callTelegram("sendMessage", {
 								chat_id: firstMessage.chat.id,
@@ -952,7 +995,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					await cmdCtx.fork(leafId, {
 						position: "at",
-						withSession: async (newCtx) => {
+						withSession: async (newCtx: any) => {
 							const newSessionId = newCtx.sessionManager.getSessionId();
 							await callTelegram("sendMessage", {
 								chat_id: firstMessage.chat.id,
@@ -1343,6 +1386,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (typeof require !== "undefined" && require.cache) {
+			for (const key of Object.keys(require.cache)) {
+				if (key.includes("pi-coding-agent") && (require.cache[key]?.exports as any)?.ExtensionRunner) {
+					patchExtensionRunnerClass((require.cache[key]!.exports as any).ExtensionRunner);
+				}
+			}
+		}
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
 		updateStatus(ctx);

@@ -4,26 +4,68 @@ import { homedir } from "node:os";
 import { ExtensionRunner, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 let activeRunner;
-const originalBindCore = ExtensionRunner.prototype.bindCore;
-ExtensionRunner.prototype.bindCore = function (actions, contextActions, providerActions) {
-    activeRunner = this;
-    return originalBindCore.call(this, actions, contextActions, providerActions);
-};
-const originalCreateContext = ExtensionRunner.prototype.createContext;
-ExtensionRunner.prototype.createContext = function () {
-    activeRunner = this;
-    return originalCreateContext.call(this);
-};
-const originalCreateCommandContext = ExtensionRunner.prototype.createCommandContext;
-ExtensionRunner.prototype.createCommandContext = function () {
-    activeRunner = this;
-    return originalCreateCommandContext.call(this);
-};
-const originalEmit = ExtensionRunner.prototype.emit;
-ExtensionRunner.prototype.emit = function (...args) {
-    activeRunner = this;
-    return originalEmit.apply(this, args);
-};
+function patchExtensionRunnerClass(RunnerClass) {
+    if (!RunnerClass || !RunnerClass.prototype)
+        return;
+    if (RunnerClass.prototype.__pitgram_patched)
+        return;
+    RunnerClass.prototype.__pitgram_patched = true;
+    const origBindCore = RunnerClass.prototype.bindCore;
+    if (typeof origBindCore === "function") {
+        RunnerClass.prototype.bindCore = function (...args) {
+            activeRunner = this;
+            return origBindCore.apply(this, args);
+        };
+    }
+    const origCreateContext = RunnerClass.prototype.createContext;
+    if (typeof origCreateContext === "function") {
+        RunnerClass.prototype.createContext = function (...args) {
+            activeRunner = this;
+            return origCreateContext.apply(this, args);
+        };
+    }
+    const origCreateCommandContext = RunnerClass.prototype.createCommandContext;
+    if (typeof origCreateCommandContext === "function") {
+        RunnerClass.prototype.createCommandContext = function (...args) {
+            activeRunner = this;
+            return origCreateCommandContext.apply(this, args);
+        };
+    }
+    const origEmit = RunnerClass.prototype.emit;
+    if (typeof origEmit === "function") {
+        RunnerClass.prototype.emit = function (...args) {
+            activeRunner = this;
+            return origEmit.apply(this, args);
+        };
+    }
+}
+// 1. Patch local imported ExtensionRunner
+patchExtensionRunnerClass(ExtensionRunner);
+// 2. Patch global/well-known installations of pi-coding-agent
+const potentialModulePaths = [
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js",
+    "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js",
+    "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js",
+];
+for (const p of potentialModulePaths) {
+    try {
+        if (typeof require !== "undefined") {
+            const mod = require(p);
+            if (mod && mod.ExtensionRunner)
+                patchExtensionRunnerClass(mod.ExtensionRunner);
+        }
+    }
+    catch { }
+}
+// 3. Inspect require.cache if available
+if (typeof require !== "undefined" && require.cache) {
+    for (const key of Object.keys(require.cache)) {
+        if (key.includes("pi-coding-agent") && require.cache[key]?.exports?.ExtensionRunner) {
+            patchExtensionRunnerClass(require.cache[key].exports.ExtensionRunner);
+        }
+    }
+}
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
@@ -1145,6 +1187,13 @@ export default function (pi) {
         },
     });
     pi.on("session_start", async (_event, ctx) => {
+        if (typeof require !== "undefined" && require.cache) {
+            for (const key of Object.keys(require.cache)) {
+                if (key.includes("pi-coding-agent") && require.cache[key]?.exports?.ExtensionRunner) {
+                    patchExtensionRunnerClass(require.cache[key].exports.ExtensionRunner);
+                }
+            }
+        }
         config = await readConfig();
         await mkdir(TEMP_DIR, { recursive: true });
         updateStatus(ctx);
