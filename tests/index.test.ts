@@ -8,12 +8,28 @@ import {
 	isImageMimeType,
 	formatTokens,
 	chunkParagraphs,
+	tgcloudAppId,
 } from "../dist/index.js";
+import { parseQueueFlag, stripQueueFlag } from "../relay/lib/queue_flags.js";
 
 test("isTelegramPrompt identifies telegram prompt prefix", () => {
 	assert.equal(isTelegramPrompt("[telegram] hello world"), true);
 	assert.equal(isTelegramPrompt("  [telegram]\nLine 2"), true);
 	assert.equal(isTelegramPrompt("hello world"), false);
+});
+
+test("tgcloudAppId validates Telegram Serverless CLI tokens", () => {
+	assert.equal(tgcloudAppId("app1234:secret-value"), "app1234");
+	assert.equal(tgcloudAppId("1234:secret-value"), undefined);
+	assert.equal(tgcloudAppId("app1234:"), undefined);
+});
+
+test("relay queue flags support immediate and delayed delivery", () => {
+	assert.deepEqual(parseQueueFlag("-q write this"), { delayMs: 0 });
+	assert.deepEqual(parseQueueFlag("-q 2h30m write this"), { delayMs: 9_000_000 });
+	assert.deepEqual(parseQueueFlag("write this --queue=45m"), { delayMs: 2_700_000 });
+	assert.equal(parseQueueFlag("-quality matters"), null);
+	assert.equal(stripQueueFlag("-q 2h30m write this"), "write this");
 });
 
 test("sanitizeFileName strips invalid characters", () => {
@@ -78,6 +94,8 @@ test("pitgram-connect and pitgram-disconnect commands emit terminal notification
 
 	assert.equal(commands.has("pitgram-connect"), true);
 	assert.equal(commands.has("pitgram-disconnect"), true);
+	assert.equal(commands.has("pitgram-relay-setup"), true);
+	assert.equal(commands.has("pitgram-relay-disable"), true);
 
 	const notifications: Array<{ message: string; type: string }> = [];
 	const mockCtx: any = {

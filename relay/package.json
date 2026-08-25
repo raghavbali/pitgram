@@ -1,0 +1,10 @@
+{
+  "name": "pitgram-relay-project",
+  "private": true,
+  "version": "1.1.0",
+  "description": "Telegram Serverless durable queue bundled with Pitgram",
+  "type": "module",
+  "devDependencies": {
+    "@tgcloud/cli": "^0.1.2"
+  }
+}

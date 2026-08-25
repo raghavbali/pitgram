@@ -1,6 +1,7 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { ExtensionRunner, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 let activeRunner;
@@ -87,6 +88,15 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+const RELAY_POLL_INTERVAL_MS = 2000;
+const RELAY_MODULE = "handlers/pi_bridge";
+const RELAY_FILES = [
+    "schema.js",
+    "handlers/pi_bridge.js",
+    "lib/queue.js",
+    "lib/pi_relay.js",
+];
+const RELAY_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "relay");
 const SYSTEM_PROMPT_SUFFIX = `
 
 Telegram bridge extension is active.
@@ -96,6 +106,10 @@ Telegram bridge extension is active.
 - Do not assume mentioning a local file path in plain text will send it to Telegram. Use pitgram_attach.`;
 export function isTelegramPrompt(prompt) {
     return prompt.trimStart().startsWith(TELEGRAM_PREFIX);
+}
+export function tgcloudAppId(token) {
+    const match = token.match(/^(app\d+):[^\s:]+$/);
+    return match?.[1];
 }
 export function sanitizeFileName(name) {
     return name.replace(/[^a-zA-Z0-9._-]+/g, "_");
@@ -220,7 +234,8 @@ async function readConfig() {
 }
 async function writeConfig(config) {
     await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
-    await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
+    await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", { encoding: "utf8", mode: 0o600 });
+    await chmod(CONFIG_PATH, 0o600).catch(() => undefined);
 }
 export async function getConfiguredModels(ctx) {
     const modelsJsonPath = join(homedir(), ".pi", "agent", "models.json");
@@ -258,6 +273,9 @@ export default function (pi) {
     let config = {};
     let pollingController;
     let pollingPromise;
+    let relayController;
+    let relayPromise;
+    let relaySourcesPromise;
     let queuedTelegramTurns = [];
     let activeTelegramTurn;
     let typingInterval;
@@ -285,7 +303,7 @@ export default function (pi) {
             ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "not configured")}`);
             return;
         }
-        if (!pollingPromise) {
+        if (!pollingPromise && !relayPromise) {
             ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "disconnected")}`);
             return;
         }
@@ -298,7 +316,8 @@ export default function (pi) {
             ctx.ui.setStatus("telegram", `${label} ${theme.fg("accent", "processing")}${queued}`);
             return;
         }
-        ctx.ui.setStatus("telegram", `${label} ${theme.fg("success", "connected")}`);
+        const mode = relayPromise ? "connected via relay" : "connected";
+        ctx.ui.setStatus("telegram", `${label} ${theme.fg("success", mode)}`);
     }
     async function callTelegram(method, body, options) {
         if (!config.botToken)
@@ -334,6 +353,50 @@ export default function (pi) {
             throw new Error(data.description || `Telegram API ${method} failed`);
         }
         return data.result;
+    }
+    async function loadRelaySources() {
+        if (!relaySourcesPromise) {
+            relaySourcesPromise = (async () => {
+                const sources = {};
+                for (const relativePath of RELAY_FILES) {
+                    const moduleName = relativePath.replace(/\.js$/, "");
+                    sources[moduleName] = await readFile(join(RELAY_DIR, relativePath), "utf8");
+                }
+                return sources;
+            })();
+        }
+        return relaySourcesPromise;
+    }
+    async function callRelay(args, signal) {
+        if (!config.relayToken)
+            throw new Error("Pitgram relay is not configured");
+        const appId = tgcloudAppId(config.relayToken);
+        if (!appId)
+            throw new Error("Invalid Telegram Serverless CLI token");
+        const response = await fetch(`https://cloud.telegram.org/${appId}/manage/run`, {
+            method: "POST",
+            headers: {
+                "authorization": `Bearer ${config.relayToken}`,
+                "content-type": "application/json",
+            },
+            body: JSON.stringify({
+                module: RELAY_MODULE,
+                sources: await loadRelaySources(),
+                args,
+                ctx: {},
+            }),
+            signal,
+        });
+        const envelope = (await response.json());
+        if (!response.ok || !envelope.ok) {
+            throw new Error(envelope.description || `Telegram Serverless relay failed (${response.status})`);
+        }
+        const result = envelope.result?.result;
+        if (!result || typeof result.ok !== "boolean")
+            throw new Error("Invalid response from Telegram Serverless relay");
+        if (!result.ok)
+            throw new Error(result.error || "Relay operation failed");
+        return result;
     }
     async function downloadTelegramFile(fileId, suggestedName) {
         if (!config.botToken)
@@ -674,6 +737,45 @@ export default function (pi) {
             queuedAttachments: [],
             content,
             historyText: formatTelegramHistoryText(rawText, files),
+        };
+    }
+    async function createRelayTelegramTurn(turn) {
+        const rawText = (turn.userText || turn.payload?.text || "").trim();
+        const files = [];
+        for (const [index, attachment] of (turn.attachments ?? []).entries()) {
+            const fallback = `attachment-${turn.id}-${index + 1}${guessExtensionFromMime(attachment.mimeType, "")}`;
+            const fileName = attachment.fileName || fallback;
+            const path = await downloadTelegramFile(attachment.fileId, fileName);
+            files.push({
+                path,
+                fileName,
+                mimeType: attachment.mimeType,
+                isImage: attachment.isImage ?? isImageMimeType(attachment.mimeType),
+            });
+        }
+        let prompt = `${TELEGRAM_PREFIX} ${rawText || "(no text)"}`;
+        if (files.length > 0) {
+            prompt += "\n\nTelegram attachments were saved locally:";
+            for (const file of files)
+                prompt += `\n- ${file.path}`;
+        }
+        const content = [{ type: "text", text: prompt }];
+        for (const file of files) {
+            if (!file.isImage)
+                continue;
+            const mediaType = file.mimeType || guessMediaType(file.path);
+            if (!mediaType)
+                continue;
+            const buffer = await readFile(file.path);
+            content.push({ type: "image", data: buffer.toString("base64"), mimeType: mediaType });
+        }
+        return {
+            chatId: turn.chatId,
+            replyToMessageId: turn.payload?.messageId ?? 0,
+            queuedAttachments: [],
+            content,
+            historyText: formatTelegramHistoryText(rawText, files),
+            relayTurnId: turn.id,
         };
     }
     async function dispatchAuthorizedTelegramMessages(messages, ctx) {
@@ -1129,6 +1231,81 @@ export default function (pi) {
         });
         updateStatus(ctx);
     }
+    async function relayLoop(ctx, signal) {
+        if (config.allowedUserId === undefined)
+            throw new Error("Pair Pitgram before enabling the relay");
+        while (!signal.aborted) {
+            try {
+                if (!activeTelegramTurn && queuedTelegramTurns.length > 0 && ctx.isIdle()) {
+                    const nextTurn = queuedTelegramTurns[0];
+                    startTypingLoop(ctx, nextTurn.chatId);
+                    updateStatus(ctx);
+                    pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
+                }
+                else if (queuedTelegramTurns.length === 0) {
+                    const result = await callRelay({ op: "next", chatId: config.allowedUserId }, signal);
+                    if (result.turn) {
+                        const relayText = (result.turn.userText || result.turn.payload?.text || "").trim().toLowerCase();
+                        if (activeTelegramTurn && currentAbort && (relayText === "stop" || relayText === "/stop")) {
+                            currentAbort();
+                            await sendTextReply(result.turn.chatId, result.turn.payload?.messageId ?? 0, "Aborted current turn.");
+                            await callRelay({ op: "done", chatId: result.turn.chatId, turnId: result.turn.id }, signal);
+                            continue;
+                        }
+                        const turn = await createRelayTelegramTurn(result.turn);
+                        queuedTelegramTurns.push(turn);
+                        updateStatus(ctx);
+                        if (!activeTelegramTurn && ctx.isIdle()) {
+                            startTypingLoop(ctx, turn.chatId);
+                            pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+                        }
+                    }
+                }
+            }
+            catch (error) {
+                if (signal.aborted)
+                    return;
+                const message = error instanceof Error ? error.message : String(error);
+                updateStatus(ctx, `relay: ${message}`);
+            }
+            await new Promise((resolve) => {
+                const onAbort = () => {
+                    clearTimeout(timer);
+                    resolve();
+                };
+                const timer = setTimeout(() => {
+                    signal.removeEventListener("abort", onAbort);
+                    resolve();
+                }, RELAY_POLL_INTERVAL_MS);
+                signal.addEventListener("abort", onAbort, { once: true });
+            });
+        }
+    }
+    async function startRelay(ctx) {
+        if (!config.relayEnabled || !config.relayToken || relayPromise)
+            return;
+        await stopPolling();
+        if (config.allowedUserId === undefined)
+            throw new Error("Pair Pitgram before enabling the relay");
+        await callRelay({ op: "online", chatId: config.allowedUserId });
+        relayController = new AbortController();
+        relayPromise = relayLoop(ctx, relayController.signal).finally(() => {
+            relayPromise = undefined;
+            relayController = undefined;
+            updateStatus(ctx);
+        });
+        updateStatus(ctx);
+    }
+    async function stopRelay() {
+        const chatId = config.allowedUserId;
+        relayController?.abort();
+        await relayPromise?.catch(() => undefined);
+        if (config.relayEnabled && config.relayToken && chatId !== undefined) {
+            await callRelay({ op: "offline", chatId }).catch(() => undefined);
+        }
+        relayPromise = undefined;
+        relayController = undefined;
+    }
     pi.registerTool({
         name: "pitgram_attach",
         label: "Pitgram Attach",
@@ -1174,7 +1351,9 @@ export default function (pi) {
             const status = [
                 `bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
                 `allowed user: ${config.allowedUserId ?? "not paired"}`,
+                `mode: ${config.relayEnabled ? "serverless relay" : "direct polling"}`,
                 `polling: ${pollingPromise ? "running" : "stopped"}`,
+                `relay: ${relayPromise ? "running" : config.relayEnabled ? "enabled" : "disabled"}`,
                 `active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
                 `queued telegram turns: ${queuedTelegramTurns.length}`,
             ];
@@ -1189,18 +1368,72 @@ export default function (pi) {
                 await promptForConfig(ctx);
                 return;
             }
-            if (pollingPromise) {
-                ctx.ui.notify("Pitgram bridge is already connected and polling.", "info");
+            if (pollingPromise || relayPromise) {
+                ctx.ui.notify("Pitgram bridge is already connected.", "info");
                 return;
             }
-            await startPolling(ctx);
+            if (config.relayEnabled) {
+                if (!config.relayToken) {
+                    ctx.ui.notify("Relay is enabled but not configured. Run /pitgram-relay-setup.", "error");
+                    return;
+                }
+                await startRelay(ctx);
+            }
+            else {
+                await startPolling(ctx);
+            }
             updateStatus(ctx);
-            ctx.ui.notify(`Pitgram bridge connected. Bot: @${config.botUsername ?? "unknown"}${config.allowedUserId ? "" : " (awaiting pairing)"}`, "info");
+            ctx.ui.notify(`Pitgram bridge connected via ${config.relayEnabled ? "Telegram Serverless relay" : "direct polling"}. Bot: @${config.botUsername ?? "unknown"}${config.allowedUserId ? "" : " (awaiting pairing)"}`, "info");
+        },
+    });
+    pi.registerCommand("pitgram-relay-setup", {
+        description: "Configure the optional Telegram Serverless offline queue",
+        handler: async (_args, ctx) => {
+            if (!ctx.hasUI)
+                return;
+            config = await readConfig();
+            if (!config.botToken || config.allowedUserId === undefined) {
+                ctx.ui.notify("Run /pitgram-setup and pair the bot before configuring its relay.", "error");
+                return;
+            }
+            const token = await ctx.ui.input("Telegram Serverless CLI access token", "app1234:...");
+            if (!token)
+                return;
+            const trimmed = token.trim();
+            if (!tgcloudAppId(trimmed)) {
+                ctx.ui.notify("Invalid token. Expected app<id>:<secret> from BotFather → Serverless → CLI Access.", "error");
+                return;
+            }
+            const previousToken = config.relayToken;
+            config.relayToken = trimmed;
+            try {
+                await callRelay({ op: "status", chatId: config.allowedUserId });
+            }
+            catch (error) {
+                config.relayToken = previousToken;
+                const message = error instanceof Error ? error.message : String(error);
+                ctx.ui.notify(`Relay validation failed: ${message}`, "error");
+                return;
+            }
+            config.relayEnabled = true;
+            await writeConfig(config);
+            ctx.ui.notify("Telegram Serverless relay enabled. Reconnect Pitgram to switch from direct polling.", "info");
+        },
+    });
+    pi.registerCommand("pitgram-relay-disable", {
+        description: "Disable the Telegram Serverless relay and use direct polling",
+        handler: async (_args, ctx) => {
+            await stopRelay();
+            config.relayEnabled = false;
+            await writeConfig(config);
+            ctx.ui.notify("Pitgram relay disabled. Run /pitgram-connect to resume direct polling.", "info");
+            updateStatus(ctx);
         },
     });
     pi.registerCommand("pitgram-disconnect", {
         description: "Stop the Pitgram bridge in this pi session",
         handler: async (_args, ctx) => {
+            await stopRelay();
             await stopPolling();
             updateStatus(ctx);
             ctx.ui.notify("Pitgram bridge disconnected.", "info");
@@ -1212,7 +1445,10 @@ export default function (pi) {
         await mkdir(TEMP_DIR, { recursive: true });
         updateStatus(ctx);
         if (config.botToken && (ctx.mode === "tui" || ctx.mode === "rpc")) {
-            await startPolling(ctx);
+            if (config.relayEnabled && config.relayToken)
+                await startRelay(ctx);
+            else
+                await startPolling(ctx);
         }
     });
     pi.on("session_shutdown", async (_event, _ctx) => {
@@ -1228,6 +1464,7 @@ export default function (pi) {
         activeTelegramTurn = undefined;
         currentAbort = undefined;
         preserveQueuedTurnsAsHistory = false;
+        await stopRelay();
         await stopPolling();
     });
     pi.on("before_agent_start", async (event) => {
@@ -1278,11 +1515,18 @@ export default function (pi) {
         const assistant = extractAssistantText(event.messages);
         if (assistant.stopReason === "aborted") {
             await clearPreview(turn.chatId);
+            if (turn.relayTurnId !== undefined) {
+                await callRelay({ op: "error", chatId: turn.chatId, turnId: turn.relayTurnId, message: "aborted" }).catch(() => undefined);
+            }
             return;
         }
         if (assistant.stopReason === "error") {
             await clearPreview(turn.chatId);
-            await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
+            const errorMessage = assistant.errorMessage || "Telegram bridge: pi failed while processing the request.";
+            await sendTextReply(turn.chatId, turn.replyToMessageId, errorMessage);
+            if (turn.relayTurnId !== undefined) {
+                await callRelay({ op: "error", chatId: turn.chatId, turnId: turn.relayTurnId, message: errorMessage }).catch(() => undefined);
+            }
             return;
         }
         const finalText = assistant.text;
@@ -1305,6 +1549,9 @@ export default function (pi) {
             }
         }
         await sendQueuedAttachments(turn);
+        if (turn.relayTurnId !== undefined) {
+            await callRelay({ op: "done", chatId: turn.chatId, turnId: turn.relayTurnId }).catch(() => undefined);
+        }
         if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
             const nextTurn = queuedTelegramTurns[0];
             startTypingLoop(ctx, nextTurn.chatId);

@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 export declare function isTelegramPrompt(prompt: string): boolean;
+export declare function tgcloudAppId(token: string): string | undefined;
 export declare function sanitizeFileName(name: string): string;
 export declare function guessExtensionFromMime(mimeType: string | undefined, fallback: string): string;
 export declare function guessMediaType(path: string): string | undefined;

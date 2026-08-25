@@ -1,7 +1,7 @@
 {
   "name": "pitgram",
-  "version": "1.0.4",
-  "description": "Telegram bridge for Pi with remote session management",
+  "version": "1.1.0",
+  "description": "Telegram bridge for Pi with remote session management and an optional durable offline relay",
   "author": "Raghav Bali",
   "license": "MIT",
   "homepage": "https://github.com/raghavbali/pitgram#readme",
@@ -19,6 +19,8 @@
     "pi-package",
     "pi-extension",
     "telegram",
+    "telegram-serverless",
+    "offline-queue",
     "bot"
   ],
   "scripts": {
@@ -28,10 +30,16 @@
     "prepublishOnly": "npm run build"
   },
   "files": [
+    "bin",
     "dist",
+    "relay",
     "src",
+    "CHANGELOG.md",
     "README.md"
   ],
+  "bin": {
+    "pitgram-relay": "./bin/pitgram-relay.js"
+  },
   "pi": {
     "extensions": [
       "./dist/index.js"
@@ -39,14 +47,17 @@
     "image": "https://raw.githubusercontent.com/raghavbali/pitgram/main/assets/screenshot.png"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@tgcloud/cli": "^0.1.2"
   }
 }
