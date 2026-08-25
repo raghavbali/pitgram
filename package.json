@@ -38,7 +38,7 @@
     "README.md"
   ],
   "bin": {
-    "pitgram-relay": "./bin/pitgram-relay.js"
+    "pitgram-relay": "bin/pitgram-relay.js"
   },
   "pi": {
     "extensions": [
