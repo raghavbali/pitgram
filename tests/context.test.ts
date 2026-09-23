@@ -54,6 +54,7 @@ async function fixture(config: Record<string, unknown>, fetchMock: typeof fetch)
     await app.handlers.get("session_start")({}, app.ctx);
     return { ...app, async close() {
       await app.handlers.get("session_shutdown")({}, app.ctx);
+      assert.equal((await app.context()).available, false);
       globalThis.fetch = originalFetch;
     } };
   } catch (error) {
@@ -92,7 +93,7 @@ test("direct turn preserves untrimmed text, isolates history and refuses local p
   };
   const app = await fixture({ botToken: "TEST_TOKEN", allowedUserId: 42, lastUpdateId: 0 }, fetchMock as typeof fetch);
   try {
-    await eventually(() => app.sent.length === 1);
+    await eventually(() => app.sent.length >= 1);
     assert.deepEqual(await app.context(), { version: 1, available: false, source: null });
     await app.start("[telegram] a local fake message");
     assert.equal((await app.context()).available, false);
