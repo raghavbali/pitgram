@@ -271,6 +271,7 @@ interface RelayTurn {
 		messageId?: number;
 		date?: number;
 		text?: string;
+		hasMedia?: boolean;
 	};
 	attachments?: RelayAttachment[];
 }
@@ -1015,11 +1016,13 @@ export default function (pi: ExtensionAPI) {
 				delivery: "relay",
 				text: turn.userText ?? turn.payload?.text ?? "",
 				chatId: turn.chatId,
-				messageId: turn.payload?.messageId ?? null,
+				messageId: typeof turn.payload?.messageId === "number" && turn.payload.messageId > 0
+					? turn.payload.messageId : null,
 				relayTurnId: turn.id,
 				timestamp: turn.payload?.date ?? null,
 				attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: file.mimeType ?? null, temporary: true })),
-				typedCaptureSupported: files.length === 0 && (turn.userText !== undefined || turn.payload?.text !== undefined),
+				typedCaptureSupported: files.length === 0 && turn.payload?.hasMedia !== true
+					&& (turn.userText !== undefined || turn.payload?.text !== undefined),
 			},
 			chatId: turn.chatId,
 			replyToMessageId: turn.payload?.messageId ?? 0,
