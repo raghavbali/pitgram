@@ -95,6 +95,36 @@ Telegram queue controls:
 /queue clear
 ```
 
+## Read-only active source context (unpublished source branch)
+
+Agents can call the `pitgram_context` tool during an active authorized Telegram turn. The tool returns version 1 JSON in both its text content and structured `details`:
+
+```json
+{
+  "version": 1,
+  "available": true,
+  "source": {
+    "kind": "telegram",
+    "delivery": "direct",
+    "text": "  remember this  ",
+    "chatId": 42,
+    "messageId": 101,
+    "relayTurnId": null,
+    "timestamp": 1700000000,
+    "attachments": [],
+    "typedCaptureSupported": true
+  }
+}
+```
+
+Outside an active authorized turn, the response is `{"version":1,"available":false,"source":null}`. Tool parameters are an empty object. A normal Pi prompt prefixed with `[telegram]` does not itself provide source context. The extension matches its own pending dispatched prompt to Pi's `before_agent_start` event and exposes only the turn activated at `agent_start`; it clears context at `agent_end` and `session_shutdown`. This relies on Pi preserving the dispatched text in `before_agent_start.prompt`; consumers should treat unavailable context as unavailable, never parse source facts from the prompt.
+
+`text` is the *current* event, separate from any earlier queued messages included in Pi's prompt after an abort. Direct single-message text retains exact Telegram `message.text` (or caption if present), including whitespace; the existing prompt still trims text for agent display. Direct albums have `text: null` because multiple messages cannot be truthfully represented as one typed event. `typedCaptureSupported` is true only for one text-only Telegram message, or a relay text turn without media. Captions, media-only messages and albums are unsupported for typed capture; downloaded attachment facts are temporary paths, with no durability or transcription guarantee.
+
+Relay `text` comes from the delivered `userText` when present (including `/queue edit` changes), falling back to the relay payload's text. The relay webhook trims incoming Telegram text and strips queue flags before it persists `userText`; edits replace that queued text. Original pre-relay whitespace cannot be recovered. `messageId` is the actual Telegram message ID if supplied, otherwise `null`; the relay's stable `relayTurnId` is additional scoped metadata, not a Telegram ID or attempt counter. For downstream idempotency, prefer the Telegram chat ID and message ID across delivery modes. With no message ID, a consumer may use a relay-scoped key composed of chat ID and relay turn ID, but cannot deduplicate it against a direct Telegram replay without the original ID. `timestamp` is Telegram's original Unix seconds if supplied in the existing payload, otherwise `null`; this relay currently omits the source timestamp. Later edits are not reconciled.
+
+For this source branch, install the required peers per `package.json`, run `npm install && npm run build`, then load with `pi -e /path/to/pitgram`. Pin the exact Git commit used by a consumer; version 1.1.0 on npm predates this API.
+
 ## Telegram commands
 
 - `/sessions` — list sessions in the current working directory.
