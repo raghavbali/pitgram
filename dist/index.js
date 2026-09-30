@@ -3,7 +3,7 @@ import { basename, dirname, extname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { ExtensionRunner, SessionManager } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 let activeRunner;
 function patchExtensionRunnerClass(RunnerClass) {
     if (!RunnerClass || !RunnerClass.prototype)
@@ -278,6 +278,7 @@ export default function (pi) {
     let relaySourcesPromise;
     let queuedTelegramTurns = [];
     let activeTelegramTurn;
+    let matchedTelegramTurn;
     let typingInterval;
     let currentAbort;
     let preserveQueuedTurnsAsHistory = false;
@@ -732,6 +733,17 @@ export default function (pi) {
             });
         }
         return {
+            source: {
+                kind: "telegram",
+                delivery: "direct",
+                text: messages.length === 1 ? (firstMessage.text ?? firstMessage.caption ?? "") : null,
+                chatId: firstMessage.chat.id,
+                messageId: firstMessage.message_id,
+                relayTurnId: null,
+                timestamp: firstMessage.date ?? null,
+                attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: file.mimeType ?? null, temporary: true })),
+                typedCaptureSupported: messages.length === 1 && firstMessage.text !== undefined && files.length === 0,
+            },
             chatId: firstMessage.chat.id,
             replyToMessageId: firstMessage.message_id,
             queuedAttachments: [],
@@ -770,6 +782,19 @@ export default function (pi) {
             content.push({ type: "image", data: buffer.toString("base64"), mimeType: mediaType });
         }
         return {
+            source: {
+                kind: "telegram",
+                delivery: "relay",
+                text: turn.userText ?? turn.payload?.text ?? "",
+                chatId: turn.chatId,
+                messageId: typeof turn.payload?.messageId === "number" && turn.payload.messageId > 0
+                    ? turn.payload.messageId : null,
+                relayTurnId: turn.id,
+                timestamp: turn.payload?.date ?? null,
+                attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: file.mimeType ?? null, temporary: true })),
+                typedCaptureSupported: files.length === 0 && turn.payload?.hasMedia !== true
+                    && (turn.userText !== undefined || turn.payload?.text !== undefined),
+            },
             chatId: turn.chatId,
             replyToMessageId: turn.payload?.messageId ?? 0,
             queuedAttachments: [],
@@ -1307,6 +1332,18 @@ export default function (pi) {
         relayController = undefined;
     }
     pi.registerTool({
+        name: "pitgram_context",
+        label: "Pitgram Context",
+        description: "Read source facts for the current authorized Telegram turn; unavailable outside that turn.",
+        parameters: Type.Object({}),
+        async execute() {
+            const details = activeTelegramTurn
+                ? { version: 1, available: true, source: activeTelegramTurn.source }
+                : { version: 1, available: false, source: null };
+            return { content: [{ type: "text", text: JSON.stringify(details) }], details };
+        },
+    });
+    pi.registerTool({
         name: "pitgram_attach",
         label: "Pitgram Attach",
         description: "Queue one or more local files to be sent with the next Telegram reply.",
@@ -1365,6 +1402,10 @@ export default function (pi) {
         handler: async (_args, ctx) => {
             config = await readConfig();
             if (!config.botToken) {
+                if (!ctx.hasUI) {
+                    ctx.ui.notify("Pitgram is not configured. Run /pitgram-setup from the Pi UI.", "error");
+                    return;
+                }
                 await promptForConfig(ctx);
                 return;
             }
@@ -1444,7 +1485,8 @@ export default function (pi) {
         config = await readConfig();
         await mkdir(TEMP_DIR, { recursive: true });
         updateStatus(ctx);
-        if (config.botToken && (ctx.mode === "tui" || ctx.mode === "rpc")) {
+        const mode = ctx.mode;
+        if (config.botToken && (mode === "tui" || mode === "rpc")) {
             if (config.relayEnabled && config.relayToken)
                 await startRelay(ctx);
             else
@@ -1453,6 +1495,7 @@ export default function (pi) {
     });
     pi.on("session_shutdown", async (_event, _ctx) => {
         queuedTelegramTurns = [];
+        matchedTelegramTurn = undefined;
         for (const state of mediaGroups.values()) {
             if (state.flushTimer)
                 clearTimeout(state.flushTimer);
@@ -1468,6 +1511,11 @@ export default function (pi) {
         await stopPolling();
     });
     pi.on("before_agent_start", async (event) => {
+        // Match the actual dispatched prompt, never the [telegram] prefix alone.
+        // A queued turn must not be assigned to an unrelated local agent run.
+        matchedTelegramTurn = queuedTelegramTurns[0]?.content[0]?.type === "text"
+            && event.prompt === queuedTelegramTurns[0].content[0].text
+            ? queuedTelegramTurns[0] : undefined;
         const suffix = isTelegramPrompt(event.prompt)
             ? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
             : SYSTEM_PROMPT_SUFFIX;
@@ -1477,7 +1525,7 @@ export default function (pi) {
     });
     pi.on("agent_start", async (_event, ctx) => {
         currentAbort = () => ctx.abort();
-        if (!activeTelegramTurn && queuedTelegramTurns.length > 0) {
+        if (!activeTelegramTurn && matchedTelegramTurn && queuedTelegramTurns[0] === matchedTelegramTurn) {
             const nextTurn = queuedTelegramTurns.shift();
             if (nextTurn) {
                 activeTelegramTurn = { ...nextTurn };
@@ -1485,6 +1533,7 @@ export default function (pi) {
                 startTypingLoop(ctx);
             }
         }
+        matchedTelegramTurn = undefined;
         updateStatus(ctx);
     });
     pi.on("message_start", async (event, _ctx) => {
@@ -1506,6 +1555,7 @@ export default function (pi) {
     });
     pi.on("agent_end", async (event, ctx) => {
         const turn = activeTelegramTurn;
+        matchedTelegramTurn = undefined;
         currentAbort = undefined;
         stopTypingLoop();
         activeTelegramTurn = undefined;

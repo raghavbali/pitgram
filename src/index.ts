@@ -7,7 +7,7 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { ExtensionRunner, SessionManager, type SessionInfo } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 let activeRunner: any | undefined;
 
@@ -1367,7 +1367,7 @@ export default function (pi: ExtensionAPI) {
 					`Thinking Level: ${currentThinking}`,
 					`Active Tools: ${activeTools || "none"}`,
 					`Working Directory: ${ctx.cwd}`,
-					`Extension Mode: ${ctx.mode}`,
+					`Extension Mode: ${(ctx as ExtensionContext & { mode?: string }).mode}`,
 				].join("\n");
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, settingsSummary);
 			} catch (error) {
@@ -1648,6 +1648,10 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			config = await readConfig();
 			if (!config.botToken) {
+				if (!ctx.hasUI) {
+					ctx.ui.notify("Pitgram is not configured. Run /pitgram-setup from the Pi UI.", "error");
+					return;
+				}
 				await promptForConfig(ctx);
 				return;
 			}
@@ -1727,7 +1731,8 @@ export default function (pi: ExtensionAPI) {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
 		updateStatus(ctx);
-		if (config.botToken && (ctx.mode === "tui" || ctx.mode === "rpc")) {
+		const mode = (ctx as ExtensionContext & { mode?: string }).mode;
+		if (config.botToken && (mode === "tui" || mode === "rpc")) {
 			if (config.relayEnabled && config.relayToken) await startRelay(ctx);
 			else await startPolling(ctx);
 		}
