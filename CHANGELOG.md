@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0
+
+- Add the read-only `pitgram_context` tool for trusted version 1 source facts during the active authorized Telegram turn.
+- Preserve direct and relay text, Telegram message identity, timestamps, and attachment support metadata for safe downstream capture.
+- Match dispatched Telegram prompts to their active turns and clear source context when each turn ends.
+- Add lifecycle tests for direct, relay, media, and unavailable context cases.
+
 ## 1.1.0
 
 - Bundle the optional Telegram Serverless relay with Pitgram.

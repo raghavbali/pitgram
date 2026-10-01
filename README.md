@@ -95,7 +95,7 @@ Telegram queue controls:
 /queue clear
 ```
 
-## Read-only active source context (unpublished source branch)
+## Read-only active source context (Pitgram 1.2.0+)
 
 Agents can call the `pitgram_context` tool during an active authorized Telegram turn. The tool returns version 1 JSON in both its text content and structured `details`:
 
@@ -123,7 +123,7 @@ Outside an active authorized turn, the response is `{"version":1,"available":fal
 
 Relay `text` comes from the delivered `userText` when present (including `/queue edit` changes), falling back to the relay payload's text. The relay webhook trims incoming Telegram text and strips queue flags before it persists `userText`; edits replace that queued text. Original pre-relay whitespace cannot be recovered. `messageId` is the actual Telegram message ID if supplied, otherwise `null`; the relay's stable `relayTurnId` is additional scoped metadata, not a Telegram ID or attempt counter. For downstream idempotency, prefer the Telegram chat ID and message ID across delivery modes. With no message ID, a consumer may use a relay-scoped key composed of chat ID and relay turn ID, but cannot deduplicate it against a direct Telegram replay without the original ID. `timestamp` is Telegram's original Unix seconds if supplied in the existing payload, otherwise `null`; this relay currently omits the source timestamp. Later edits are not reconciled.
 
-For this source branch, install the required peers per `package.json`, run `npm install && npm run build`, then load with `pi -e /path/to/pitgram`. Pin the exact Git commit used by a consumer; version 1.1.0 on npm predates this API.
+Install the current release with `pi install npm:pitgram`. Pitgram 1.1.0 does not contain `pitgram_context`; upgrade to 1.2.0 or later and restart Pi to load the tool. Source development still uses `npm install`, `npm run build`, then `pi -e /path/to/pitgram`.
 
 ## Telegram commands
 
