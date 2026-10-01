@@ -100,6 +100,11 @@ test("direct turn preserves untrimmed text, isolates history and refuses local p
     await app.end();
     await app.start(app.sent[0][0].text);
     const first = await app.context();
+    assert.equal(first.version, 1);
+    assert.equal(first.available, true);
+    assert.equal(first.source.kind, "telegram");
+    assert.equal(first.source.delivery, "direct");
+    assert.deepEqual(first.source.attachments, []);
     assert.equal(first.source.text, "  remember this  \n");
     assert.equal(first.source.chatId, 42);
     assert.equal(first.source.messageId, 101);
@@ -146,6 +151,9 @@ test("relay uses edited delivered text and a stable relay fallback when message 
     await eventually(() => app.sent.length > 0);
     await app.start(app.sent[0][0].text);
     const source = (await app.context()).source;
+    assert.equal(source.kind, "telegram");
+    assert.equal(source.delivery, "relay");
+    assert.deepEqual(source.attachments, []);
     assert.equal(source.text, "edited queue text");
     assert.equal(source.messageId, null);
     assert.equal(source.relayTurnId, 77);
@@ -155,6 +163,83 @@ test("relay uses edited delivered text and a stable relay fallback when message 
     assert.equal((await app.context()).available, false);
   } finally {
     await app.close();
+  }
+});
+
+test("direct attachment and voice events never advertise typed capture", async () => {
+  for (const media of [
+    { caption: "idea: this is a test idea", document: { file_id: "document", file_name: "note.txt" } },
+    { voice: { file_id: "voice", mime_type: "audio/ogg" } },
+  ]) {
+    let dispatched = false;
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      const method = url.split("/").pop();
+      if (method === "getUpdates") {
+        if (!dispatched) {
+          dispatched = true;
+          return fakeResponse([{ update_id: 1, message: {
+            message_id: 101, chat: { id: 42, type: "private" }, from: { id: 42 }, ...media,
+          } }]);
+        }
+        await new Promise<void>((resolve) => init?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+        return fakeResponse([]);
+      }
+      if (method === "getFile") return fakeResponse({ file_path: "fixture" });
+      if (url.includes("/file/bot")) return new Response("offline media fixture");
+      if (method === "deleteWebhook" || method === "sendChatAction") return fakeResponse(true);
+      if (method === "sendMessage" || method === "sendMessageDraft") return fakeResponse({ message_id: 500 });
+      throw Error("Unexpected fixture network call");
+    };
+    const app = await fixture({ botToken: "TEST_TOKEN", allowedUserId: 42, lastUpdateId: 0 }, fetchMock as typeof fetch);
+    try {
+      await eventually(() => app.sent.length > 0);
+      await app.start(app.sent[0][0].text);
+      const envelope = await app.context();
+      assert.equal(envelope.available, true);
+      assert.equal(envelope.source.typedCaptureSupported, false);
+      assert.equal(envelope.source.attachments.length, 1);
+      assert.equal(envelope.source.attachments[0].temporary, true);
+      assert.equal(envelope.source.timestamp, null);
+      await app.end();
+    } finally {
+      await app.close();
+    }
+  }
+});
+
+test("relay preserves actual message identity and refuses flagged media without downloads", async () => {
+  for (const hasMedia of [false, true]) {
+    let claimed = false;
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      if (url.includes("cloud.telegram.org")) {
+        const { args } = JSON.parse(String(init?.body));
+        let result: any = { ok: true };
+        if (args.op === "next") {
+          result.turn = claimed ? null : { id: 77, chatId: 42,
+            userText: "idea: this is a test idea", payload: { messageId: 101, hasMedia } };
+          claimed = true;
+        }
+        return { ok: true, json: async () => ({ ok: true, result: { result } }) } as Response;
+      }
+      return fakeResponse({ message_id: 501 });
+    };
+    const app = await fixture({ botToken: "TEST_TOKEN", allowedUserId: 42,
+      relayEnabled: true, relayToken: "app123:TEST" }, fetchMock as typeof fetch);
+    try {
+      await eventually(() => app.sent.length > 0);
+      await app.start(app.sent[0][0].text);
+      const envelope = await app.context();
+      assert.equal(envelope.version, 1);
+      assert.equal(envelope.available, true);
+      assert.equal(envelope.source.text, "idea: this is a test idea");
+      assert.equal(envelope.source.messageId, 101);
+      assert.equal(envelope.source.relayTurnId, 77);
+      assert.equal(envelope.source.timestamp, null);
+      assert.equal(envelope.source.typedCaptureSupported, !hasMedia);
+      await app.end();
+    } finally {
+      await app.close();
+    }
   }
 });
 
