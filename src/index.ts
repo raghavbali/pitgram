@@ -474,6 +474,8 @@ export default function (pi: ExtensionAPI) {
 	let relayPromise: Promise<void> | undefined;
 	let relaySourcesPromise: Promise<Record<string, string>> | undefined;
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
+	let dispatchedTelegramTurn: PendingTelegramTurn | undefined;
+	let dispatchTimer: ReturnType<typeof setTimeout> | undefined;
 	let activeTelegramTurn: ActiveTelegramTurn | undefined;
 	let matchedTelegramTurn: PendingTelegramTurn | undefined;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
@@ -486,6 +488,18 @@ export default function (pi: ExtensionAPI) {
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 	let sessionCache: SessionInfo[] = [];
 	let modelCache: any[] = [];
+
+	function dispatchNextTelegramTurn(ctx: ExtensionContext): void {
+		if (activeTelegramTurn || dispatchedTelegramTurn || preserveQueuedTurnsAsHistory || !ctx.isIdle()) return;
+		const turn = queuedTelegramTurns[0];
+		if (!turn) return;
+		// Pi's prompt preflight is asynchronous: isIdle() may stay true after submission.
+		// Reserve the queue head before submitting so a burst cannot start a second prompt.
+		dispatchedTelegramTurn = turn;
+		startTypingLoop(ctx, turn.chatId);
+		updateStatus(ctx);
+		pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+	}
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -1395,11 +1409,7 @@ export default function (pi: ExtensionAPI) {
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns);
 		queuedTelegramTurns.push(turn);
-		if (ctx.isIdle()) {
-			startTypingLoop(ctx, turn.chatId);
-			updateStatus(ctx);
-			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
-		}
+		dispatchNextTelegramTurn(ctx);
 	}
 
 	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
@@ -1506,10 +1516,7 @@ export default function (pi: ExtensionAPI) {
 		while (!signal.aborted) {
 			try {
 				if (!activeTelegramTurn && queuedTelegramTurns.length > 0 && ctx.isIdle()) {
-					const nextTurn = queuedTelegramTurns[0];
-					startTypingLoop(ctx, nextTurn.chatId);
-					updateStatus(ctx);
-					pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
+					dispatchNextTelegramTurn(ctx);
 				} else if (queuedTelegramTurns.length === 0) {
 					const result = await callRelay<RelayTurn>({ op: "next", chatId: config.allowedUserId }, signal);
 					if (result.turn) {
@@ -1523,10 +1530,7 @@ export default function (pi: ExtensionAPI) {
 						const turn = await createRelayTelegramTurn(result.turn);
 						queuedTelegramTurns.push(turn);
 						updateStatus(ctx);
-						if (!activeTelegramTurn && ctx.isIdle()) {
-							startTypingLoop(ctx, turn.chatId);
-							pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
-						}
+						dispatchNextTelegramTurn(ctx);
 					}
 				}
 			} catch (error) {
@@ -1634,6 +1638,7 @@ export default function (pi: ExtensionAPI) {
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
 				`allowed user: ${config.allowedUserId ?? "not paired"}`,
 				`mode: ${config.relayEnabled ? "serverless relay" : "direct polling"}`,
+				`dispatch: serialized (agent_settled)`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
 				`relay: ${relayPromise ? "running" : config.relayEnabled ? "enabled" : "disabled"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
@@ -1739,6 +1744,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
+		if (dispatchTimer !== undefined) clearTimeout(dispatchTimer);
+		dispatchTimer = undefined;
+		dispatchedTelegramTurn = undefined;
 		queuedTelegramTurns = [];
 		matchedTelegramTurn = undefined;
 		for (const state of mediaGroups.values()) {
@@ -1758,9 +1766,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => {
 		// Match the actual dispatched prompt, never the [telegram] prefix alone.
 		// A queued turn must not be assigned to an unrelated local agent run.
-		matchedTelegramTurn = queuedTelegramTurns[0]?.content[0]?.type === "text"
-			&& event.prompt === queuedTelegramTurns[0].content[0].text
-			? queuedTelegramTurns[0] : undefined;
+		matchedTelegramTurn = dispatchedTelegramTurn === queuedTelegramTurns[0]
+			&& dispatchedTelegramTurn?.content[0]?.type === "text"
+			&& event.prompt === dispatchedTelegramTurn.content[0].text
+			? dispatchedTelegramTurn : undefined;
 		const suffix = isTelegramPrompt(event.prompt)
 			? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
 			: SYSTEM_PROMPT_SUFFIX;
@@ -1774,6 +1783,7 @@ export default function (pi: ExtensionAPI) {
 		if (!activeTelegramTurn && matchedTelegramTurn && queuedTelegramTurns[0] === matchedTelegramTurn) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
+				dispatchedTelegramTurn = undefined;
 				activeTelegramTurn = { ...nextTurn };
 				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 				startTypingLoop(ctx);
@@ -1850,14 +1860,15 @@ export default function (pi: ExtensionAPI) {
 		if (turn.relayTurnId !== undefined) {
 			await callRelay({ op: "done", chatId: turn.chatId, turnId: turn.relayTurnId }).catch(() => undefined);
 		}
+	});
 
-		if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
-			const nextTurn = queuedTelegramTurns[0];
-			startTypingLoop(ctx, nextTurn.chatId);
-			updateStatus(ctx);
-			setTimeout(() => {
-				pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
-			}, 0);
-		}
+	pi.on("agent_settled", (_event, ctx) => {
+		// agent_end can precede retry/compaction and the runtime is still processing.
+		// Schedule outside the notification-only settled handler, then recheck idle.
+		if (dispatchTimer !== undefined || queuedTelegramTurns.length === 0) return;
+		dispatchTimer = setTimeout(() => {
+			dispatchTimer = undefined;
+			dispatchNextTelegramTurn(ctx);
+		}, 0);
 	});
 }
