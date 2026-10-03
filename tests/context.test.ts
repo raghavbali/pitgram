@@ -36,6 +36,7 @@ function register() {
   const end = async (stopReason = "aborted") => {
     await handlers.get("agent_end")({ messages: [{ role: "assistant", stopReason, content: [] }] }, ctx);
     idle = true;
+    await handlers.get("agent_settled")({}, ctx);
   };
   return { handlers, sent, ctx, context, start, end, setIdle: (value: boolean) => { idle = value; } };
 }

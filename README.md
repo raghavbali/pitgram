@@ -34,6 +34,23 @@ pi -e /path/to/pitgram
 
 Pitgram now uses Telegram `getUpdates` directly. This mode requires Pi to be running and remains the default.
 
+Telegram retains unreceived bot updates for [no longer than 24 hours](https://core.telegram.org/bots/api#getting-updates).
+With an existing saved polling offset, Pitgram fetches messages sent while it was
+disconnected when it reconnects. Backlog messages are submitted one at a time in
+arrival order. Messages received while Pi is busy wait for the run's final
+`agent_settled` event, including any automatic retry or compaction, before dispatch.
+Use a current Pi runtime that provides this event.
+
+Run the bridge in only one Pi session for a given bot. Another session using the
+same bot can fetch its pending updates even if the first session is disconnected;
+use `/pitgram-status` and `/pitgram-disconnect` in each session to check.
+
+Direct mode is not a durable processing queue: the polling offset is saved before
+agent processing completes, and fetched turns wait in memory. A crash, shutdown,
+or reload can lose fetched but unfinished turns. A short offline/reconnect test
+does not prove retention at the 24-hour boundary. Use the optional relay for
+durable pending storage, subject to its separate interrupted-turn recovery limits.
+
 ## Optional Telegram Serverless relay
 
 The relay is bundled in Pitgram 1.1.0 and later. It owns the bot webhook and persists every incoming turn in Telegram Serverless SQLite. The local extension polls that durable queue through Telegram Serverless's authenticated management API. This design deliberately does **not** combine a webhook with `getUpdates`, and it does not rely on bot-sent messages reappearing as incoming updates.
