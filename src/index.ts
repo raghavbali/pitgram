@@ -1638,6 +1638,7 @@ export default function (pi: ExtensionAPI) {
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
 				`allowed user: ${config.allowedUserId ?? "not paired"}`,
 				`mode: ${config.relayEnabled ? "serverless relay" : "direct polling"}`,
+				`dispatch: serialized (agent_settled)`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
 				`relay: ${relayPromise ? "running" : config.relayEnabled ? "enabled" : "disabled"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,

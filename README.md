@@ -41,6 +41,11 @@ arrival order. Messages received while Pi is busy wait for the run's final
 `agent_settled` event, including any automatic retry or compaction, before dispatch.
 Use a current Pi runtime that provides this event.
 
+After updating Pitgram's compiled JavaScript, fully exit and restart Pi. Pi's
+native module cache can retain the previous build across `/reload`. Run
+`/pitgram-status` after restarting; this build reports
+`dispatch: serialized (agent_settled)`.
+
 Run the bridge in only one Pi session for a given bot. Another session using the
 same bot can fetch its pending updates even if the first session is disconnected;
 use `/pitgram-status` and `/pitgram-disconnect` in each session to check.
