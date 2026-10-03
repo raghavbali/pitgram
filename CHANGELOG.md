@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1
+
+- Serialize Telegram backlog dispatch through Pi prompt preflight and wait for `agent_settled` before starting the next turn.
+- Drain messages received during a local Pi turn after that turn settles, while preserving FIFO order and Telegram source context.
+- Add `/pitgram-status` dispatch diagnostics and reconnect-batch tests using the installed Pi session runtime.
+- Document Telegram's retention window, direct polling's in-memory queue limits, and the full Pi restart required to load an updated compiled extension.
+
 ## 1.2.0
 
 - Add the read-only `pitgram_context` tool for trusted version 1 source facts during the active authorized Telegram turn.
