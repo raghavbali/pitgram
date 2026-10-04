@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,7 +46,8 @@ function fakeResponse(result: unknown) {
   return { ok: true, json: async () => ({ ok: true, result }) } as Response;
 }
 
-async function fixture(config: Record<string, unknown>, fetchMock: typeof fetch) {
+async function fixture(config: Record<string, unknown>, fetchMock: typeof fetch, recover = false) {
+  if (!recover) await rm(join(testHome, ".pi", "agent", "pitgram"), { recursive: true, force: true });
   await mkdir(join(testHome, ".pi", "agent"), { recursive: true });
   await writeFile(join(testHome, ".pi", "agent", "telegram.json"), JSON.stringify(config));
   const originalFetch = globalThis.fetch;
@@ -65,7 +67,7 @@ async function fixture(config: Record<string, unknown>, fetchMock: typeof fetch)
 }
 
 async function eventually(predicate: () => boolean) {
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 200; i++) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -242,6 +244,51 @@ test("relay preserves actual message identity and refuses flagged media without 
       await app.close();
     }
   }
+});
+
+test("a media group survives shutdown during aggregation and recovers both raw attachment identities", async () => {
+  let fetched = false;
+  let acknowledged = false;
+  let downloads = 0;
+  const fetchMock = (async (url: string, init?: RequestInit) => {
+    const method = url.split("/").pop();
+    if (method === "getUpdates") {
+      if (!fetched) {
+        fetched = true;
+        return fakeResponse([1, 2].map(id => ({ update_id: id, message: {
+          message_id: 100 + id, chat: { id: 42, type: "private" }, from: { id: 42 },
+          media_group_id: "album", document: { file_id: `file-${id}`, file_name: `note-${id}.txt` },
+        } })));
+      }
+      acknowledged = JSON.parse(String(init?.body)).offset === 3;
+      await new Promise<void>(resolve => {
+        if (init?.signal?.aborted) resolve();
+        else init?.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return fakeResponse([]);
+    }
+    if (method === "getFile") { downloads++; return fakeResponse({ file_path: "fixture" }); }
+    if (url.includes("/file/bot")) return new Response("media fixture");
+    if (["deleteWebhook", "sendChatAction"].includes(method!)) return fakeResponse(true);
+    if (["sendMessage", "sendMessageDraft"].includes(method!)) return fakeResponse({ message_id: 500 });
+    throw new Error("Unexpected fixture network call");
+  }) as typeof fetch;
+  const config = { botToken: "TEST_TOKEN", allowedUserId: 42, lastUpdateId: 0 };
+  const first = await fixture(config, fetchMock);
+  await eventually(() => acknowledged);
+  assert.equal(downloads, 0, "Aggregation has not yet dispatched or downloaded");
+  await first.close();
+  const recovered = await fixture(config, fetchMock, true);
+  try {
+    await eventually(() => recovered.sent.length === 1);
+    await recovered.start(recovered.sent[0][0].text);
+    assert.equal(downloads, 2);
+    assert.equal((await recovered.context()).source.attachments.length, 2);
+    await recovered.end("stop");
+    const identity = createHash("sha256").update("TEST_TOKEN").digest("hex");
+    const snapshot = JSON.parse(await readFile(join(testHome, ".pi/agent/pitgram/queue", `${identity}.json`), "utf8"));
+    assert.deepEqual(snapshot.entries, []);
+  } finally { await recovered.close(); }
 });
 
 test.after(async () => {

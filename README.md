@@ -39,7 +39,7 @@ With an existing saved polling offset, Pitgram fetches messages sent while it wa
 disconnected when it reconnects. Backlog messages are submitted one at a time in
 arrival order. Messages received while Pi is busy wait for the run's final
 `agent_settled` event, including any automatic retry or compaction, before dispatch.
-Use a current Pi runtime that provides this event.
+Use Pi 1.0.0 or later and Node.js 22.19.0 or later.
 
 After updating Pitgram's compiled JavaScript, fully exit and restart Pi. Pi's
 native module cache can retain the previous build across `/reload`. Run
@@ -50,11 +50,29 @@ Run the bridge in only one Pi session for a given bot. Another session using the
 same bot can fetch its pending updates even if the first session is disconnected;
 use `/pitgram-status` and `/pitgram-disconnect` in each session to check.
 
-Direct mode is not a durable processing queue: the polling offset is saved before
-agent processing completes, and fetched turns wait in memory. A crash, shutdown,
-or reload can lose fetched but unfinished turns. A short offline/reconnect test
-does not prove retention at the 24-hour boundary. Use the optional relay for
-durable pending storage, subject to its separate interrupted-turn recovery limits.
+Direct mode saves each fetched batch locally **before** advancing Telegram's
+polling offset. The owner-only inbox lives in `~/.pi/agent/pitgram/queue/`, scoped
+by bot identity, and stores raw text and Telegram file IDs. Pending messages and
+interrupted running turns recover in order after a restart; attachments are
+downloaded again from their file IDs. Successful processing and final reply
+delivery remove the stored payload. A local exclusive owner prevents another
+updated Pitgram session from overwriting or replaying the same inbox. Disconnect
+the first bridge and let its active/queued work finish before connecting another.
+Older Pitgram versions and pollers on other machines still require manual
+coordination: keep only one consumer for a given bot.
+
+`/pitgram-status` reports durable pending/running/failed counts and failed update
+IDs. Model failures, explicit aborts, rejected prompts, and failed final replies
+stay held rather than replaying automatically. Retry one with
+`/pitgram-retry <update-id>`, or all failed entries with `/pitgram-retry all`.
+
+Recovery provides **at-least-once processing**. A crash after a tool action or
+reply succeeds but before completion is saved can repeat that action or reply
+when the turn recovers. This inbox protects updates already fetched by Pi; it
+does not extend Telegram's retention for messages sent while every bridge is
+offline. A short reconnect test does not prove the 24-hour boundary. The optional
+relay provides storage while Pi is offline, with its separate interrupted-turn
+recovery limits.
 
 ## Optional Telegram Serverless relay
 

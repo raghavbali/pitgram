@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0
+
+- Persist direct-polling raw batches before advancing Telegram's offset, with synced atomic snapshots and owner-only permissions.
+- Recover pending and interrupted turns after restart; protect each local bot inbox with an exclusive owner released on crash.
+- Keep source context and final replies attached to the turn through automatic model retries.
+- Hold failed or aborted updates for explicit `/pitgram-retry <update-id|all>` and report queue counts in `/pitgram-status`.
+- Document at-least-once recovery, duplicate-action limits, and unchanged Telegram offline retention.
+- Require Pi 1.0.0 or later and Node.js 22.19.0 or later.
+
 ## 1.2.1
 
 - Serialize Telegram backlog dispatch through Pi prompt preflight and wait for `agent_settled` before starting the next turn.

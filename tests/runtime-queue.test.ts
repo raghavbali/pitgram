@@ -33,10 +33,9 @@ const aiDirectory = hostRequire?.resolve.paths("@earendil-works/pi-ai")
 const createAssistantMessageEventStream = aiDirectory
   ? (await import(pathToFileURL(join(aiDirectory, "dist/index.js")).href)).createAssistantMessageEventStream : undefined;
 
-test("installed Pi session processes a reconnect batch without concurrent prompt errors", {
-  skip: !pi?.ModelRuntime && "Set PI_BINARY to an installed Pi host with ModelRuntime",
-}, async () => {
+async function runReconnectBatch(retryOnce = false, rejectPreflight = false) {
   const agentDir = join(testHome, ".pi/agent");
+  await rm(join(agentDir, "pitgram"), { recursive: true, force: true });
   await mkdir(agentDir, { recursive: true });
   await writeFile(join(agentDir, "telegram.json"), JSON.stringify({
     botToken: "TEST_TOKEN", allowedUserId: 42, lastUpdateId: 100,
@@ -47,6 +46,7 @@ test("installed Pi session processes a reconnect batch without concurrent prompt
   const replies: string[] = [];
   let returnedBatch = false;
   let session: any;
+  let settledRuns = 0;
   globalThis.fetch = (async (url: string, init: RequestInit) => {
     assert.ok(url.startsWith("https://api.telegram.org/botTEST_TOKEN/"), "No real Telegram or model network calls");
     const method = url.split("/").pop();
@@ -94,11 +94,18 @@ test("installed Pi session processes a reconnect batch without concurrent prompt
           api: model.api, provider: model.provider, model: model.id, stopReason: "stop", timestamp: Date.now(),
           usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-        queueMicrotask(() => { stream.push({ type: "done", reason: "stop", message }); stream.end(message); });
+        if (retryOnce && processed.length === 1) {
+          message.stopReason = "error";
+          message.errorMessage = "503 service unavailable";
+          message.content = [];
+          queueMicrotask(() => { stream.push({ type: "error", reason: "error", error: message }); stream.end(message); });
+        } else {
+          queueMicrotask(() => { stream.push({ type: "done", reason: "stop", message }); stream.end(message); });
+        }
         return stream;
       },
     });
-    const settingsManager = pi.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+    const settingsManager = pi.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: retryOnce, maxRetries: 1, baseDelayMs: 1 } });
     const loader = new pi.DefaultResourceLoader({ cwd: testHome, agentDir, settingsManager,
       noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
       additionalExtensionPaths: [fileURLToPath(new URL("../dist/index.js", import.meta.url))] });
@@ -107,13 +114,23 @@ test("installed Pi session processes a reconnect batch without concurrent prompt
     ({ session } = await pi.createAgentSession({ cwd: testHome, agentDir,
       modelRuntime: runtime, model: runtime.getModel("pitgram-fixture", "fixture"),
       settingsManager, resourceLoader: loader, sessionManager: pi.SessionManager.inMemory(), tools: [] }));
+    if (rejectPreflight) {
+      const send = session.sendUserMessage.bind(session);
+      let reject = true;
+      session.sendUserMessage = async (...args: any[]) => {
+        if (reject) { reject = false; throw new Error("fixture preflight rejection"); }
+        return send(...args);
+      };
+    }
+    session.subscribe((event: any) => { if (event.type === "agent_settled") settledRuns++; });
     await session.bindExtensions({ mode: "tui", onError: (error: any) => errors.push(error.error) });
-    for (let i = 0; i < 400 && (processed.length < 2 || !session.isIdle); i++) {
+    for (let i = 0; i < 400 && (settledRuns < (rejectPreflight ? 1 : 2) || !session.isIdle); i++) {
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    assert.deepEqual(errors, [], "The actual Pi extension sendUserMessage path must not report prompt errors");
-    assert.deepEqual(processed, ["[telegram] A", "[telegram] B"]);
-    assert.ok(replies.some(text => text.includes("[telegram] A")));
+    assert.deepEqual(errors, rejectPreflight ? ["fixture preflight rejection"] : [], "The actual Pi extension sendUserMessage path must report only the fixture rejection");
+    assert.deepEqual(processed, rejectPreflight ? ["[telegram] B"] : retryOnce ? ["[telegram] A", "[telegram] A", "[telegram] B"] : ["[telegram] A", "[telegram] B"]);
+    assert.equal(settledRuns, rejectPreflight ? 1 : 2);
+    if (!rejectPreflight) assert.ok(replies.some(text => text.includes("[telegram] A")));
     assert.ok(replies.some(text => text.includes("[telegram] B")));
   } finally {
     if (session) {
@@ -122,7 +139,12 @@ test("installed Pi session processes a reconnect batch without concurrent prompt
     }
     globalThis.fetch = originalFetch;
   }
-});
+}
+
+const hostOptions = { skip: !pi?.ModelRuntime && "Set PI_BINARY to an installed Pi host with ModelRuntime" };
+test("installed Pi session processes a reconnect batch without concurrent prompt errors", hostOptions, () => runReconnectBatch());
+test("installed Pi automatic retry preserves Telegram reply ownership and delivers its successor", hostOptions, () => runReconnectBatch(true));
+test("installed Pi preflight rejection retains the failed message and allows its successor to run", hostOptions, () => runReconnectBatch(false, true));
 
 test.after(async () => {
   os.homedir = originalHomedir;
