@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { ExtensionRunner, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { DurableQueue } from "./durable-queue.js";
 let activeRunner;
 function patchExtensionRunnerClass(RunnerClass) {
     if (!RunnerClass || !RunnerClass.prototype)
@@ -273,14 +274,22 @@ export default function (pi) {
     let config = {};
     let pollingController;
     let pollingPromise;
+    let pollingStartup;
     let relayController;
     let relayPromise;
     let relaySourcesPromise;
     let queuedTelegramTurns = [];
+    let durableQueue;
+    let durableBotIdentity;
+    const durableMessageTasks = new Set();
+    const ingestedUpdateIds = new Set();
+    let shuttingDown = false;
     let dispatchedTelegramTurn;
     let dispatchTimer;
     let activeTelegramTurn;
     let matchedTelegramTurn;
+    let lastTelegramResult;
+    let removeRuntimeErrorListener;
     let typingInterval;
     let currentAbort;
     let preserveQueuedTurnsAsHistory = false;
@@ -292,7 +301,7 @@ export default function (pi) {
     let sessionCache = [];
     let modelCache = [];
     function dispatchNextTelegramTurn(ctx) {
-        if (activeTelegramTurn || dispatchedTelegramTurn || preserveQueuedTurnsAsHistory || !ctx.isIdle())
+        if (shuttingDown || activeTelegramTurn || dispatchedTelegramTurn || preserveQueuedTurnsAsHistory || !ctx.isIdle())
             return;
         const turn = queuedTelegramTurns[0];
         if (!turn)
@@ -302,7 +311,40 @@ export default function (pi) {
         dispatchedTelegramTurn = turn;
         startTypingLoop(ctx, turn.chatId);
         updateStatus(ctx);
-        pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+        void (async () => {
+            if (turn.durableUpdateIds?.length)
+                await durableQueue.running(turn.durableUpdateIds);
+            if (shuttingDown || dispatchedTelegramTurn !== turn)
+                return;
+            pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+        })().catch(() => { void rejectDispatchedTurn(ctx); });
+    }
+    async function rejectDispatchedTurn(ctx) {
+        const turn = dispatchedTelegramTurn;
+        if (!turn)
+            return;
+        let removed = false;
+        try {
+            if (turn.durableUpdateIds?.length)
+                await durableQueue.fail(turn.durableUpdateIds);
+            if (queuedTelegramTurns[0] === turn) {
+                queuedTelegramTurns.shift();
+                removed = true;
+            }
+        }
+        catch {
+            // Keep the queue head when the failure state cannot be committed.
+        }
+        finally {
+            if (dispatchedTelegramTurn === turn)
+                dispatchedTelegramTurn = undefined;
+            matchedTelegramTurn = undefined;
+            stopTypingLoop();
+            updateStatus(ctx, "Telegram dispatch failed; message retained. Use /pitgram-retry or restart.");
+            if (removed && !shuttingDown && dispatchTimer === undefined) {
+                dispatchTimer = setTimeout(() => { dispatchTimer = undefined; dispatchNextTelegramTurn(ctx); }, 0);
+            }
+        }
     }
     function allocateDraftId() {
         nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -520,7 +562,7 @@ export default function (pi) {
         if (!previewState || previewState.flushTimer)
             return;
         previewState.flushTimer = setTimeout(() => {
-            void flushPreview(chatId);
+            void flushPreview(chatId).catch(() => undefined);
         }, PREVIEW_THROTTLE_MS);
     }
     async function finalizePreview(chatId) {
@@ -554,6 +596,7 @@ export default function (pi) {
         return lastMessageId;
     }
     async function sendQueuedAttachments(turn) {
+        let failed = false;
         for (const attachment of turn.queuedAttachments) {
             try {
                 const mediaType = guessMediaType(attachment.path);
@@ -564,10 +607,13 @@ export default function (pi) {
                 }, fieldName, attachment.path, attachment.fileName);
             }
             catch (error) {
+                failed = true;
                 const message = error instanceof Error ? error.message : String(error);
                 await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`);
             }
         }
+        if (failed)
+            throw new Error("Telegram attachment delivery incomplete");
     }
     function extractAssistantText(messages) {
         for (let i = messages.length - 1; i >= 0; i--) {
@@ -693,11 +739,22 @@ export default function (pi) {
         }
     }
     async function stopPolling() {
+        await pollingStartup;
         stopTypingLoop();
         pollingController?.abort();
         pollingController = undefined;
         await pollingPromise?.catch(() => undefined);
         pollingPromise = undefined;
+        await closeIdleDurableQueue();
+    }
+    async function closeIdleDurableQueue() {
+        if (pollingPromise || pollingStartup || activeTelegramTurn || dispatchedTelegramTurn || queuedTelegramTurns.length || mediaGroups.size || durableMessageTasks.size)
+            return;
+        const queue = durableQueue;
+        durableQueue = undefined;
+        durableBotIdentity = undefined;
+        ingestedUpdateIds.clear();
+        await queue?.close();
     }
     function formatTelegramHistoryText(rawText, files) {
         let summary = rawText.length > 0 ? rawText : "(no text)";
@@ -818,7 +875,7 @@ export default function (pi) {
             relayTurnId: turn.id,
         };
     }
-    async function dispatchAuthorizedTelegramMessages(messages, ctx) {
+    async function dispatchAuthorizedTelegramMessages(messages, ctx, updateIds = []) {
         const firstMessage = messages[0];
         if (!firstMessage)
             return;
@@ -1167,17 +1224,42 @@ export default function (pi) {
             }
             return;
         }
-        const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
-        preserveQueuedTurnsAsHistory = false;
+        const historyTurns = preserveQueuedTurnsAsHistory ? [...queuedTelegramTurns] : [];
         const turn = await createTelegramTurn(messages, historyTurns);
+        if (historyTurns.length)
+            queuedTelegramTurns.splice(0, historyTurns.length);
+        preserveQueuedTurnsAsHistory = false;
+        turn.durableUpdateIds = [...historyTurns.flatMap(history => history.durableUpdateIds ?? []), ...updateIds];
         queuedTelegramTurns.push(turn);
         dispatchNextTelegramTurn(ctx);
+        return turn;
     }
-    async function handleAuthorizedTelegramMessage(message, ctx) {
+    async function processDurableMessages(messages, updateIds, ctx) {
+        const task = (async () => {
+            try {
+                const turn = await dispatchAuthorizedTelegramMessages(messages, ctx, updateIds);
+                if (!turn)
+                    await durableQueue.complete(updateIds);
+            }
+            catch {
+                await durableQueue.fail(updateIds);
+                updateStatus(ctx, "Telegram message retained as failed; use /pitgram-retry.");
+            }
+        })();
+        durableMessageTasks.add(task);
+        try {
+            await task;
+        }
+        finally {
+            durableMessageTasks.delete(task);
+        }
+    }
+    async function handleAuthorizedTelegramMessage(message, ctx, updateId) {
         if (message.media_group_id) {
             const key = `${message.chat.id}:${message.media_group_id}`;
-            const existing = mediaGroups.get(key) ?? { messages: [] };
+            const existing = mediaGroups.get(key) ?? { messages: [], updateIds: [] };
             existing.messages.push(message);
+            existing.updateIds.push(updateId);
             if (existing.flushTimer)
                 clearTimeout(existing.flushTimer);
             existing.flushTimer = setTimeout(() => {
@@ -1185,17 +1267,21 @@ export default function (pi) {
                 mediaGroups.delete(key);
                 if (!state)
                     return;
-                void dispatchAuthorizedTelegramMessages(state.messages, ctx);
+                void processDurableMessages(state.messages, state.updateIds, ctx).catch(() => {
+                    updateStatus(ctx, "Could not update durable Telegram queue; restart to recover.");
+                });
             }, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
             mediaGroups.set(key, existing);
             return;
         }
-        await dispatchAuthorizedTelegramMessages([message], ctx);
+        await processDurableMessages([message], [updateId], ctx);
     }
     async function handleUpdate(update, ctx) {
         const message = update.message || update.edited_message;
-        if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot)
+        if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) {
+            await durableQueue.complete([update.update_id]);
             return;
+        }
         if (config.allowedUserId === undefined) {
             config.allowedUserId = message.from.id;
             await writeConfig(config);
@@ -1204,31 +1290,43 @@ export default function (pi) {
         }
         if (message.from.id !== config.allowedUserId) {
             await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
+            await durableQueue.complete([update.update_id]);
             return;
         }
-        await handleAuthorizedTelegramMessage(message, ctx);
+        await handleAuthorizedTelegramMessage(message, ctx, update.update_id);
+    }
+    async function restorePendingUpdates(ctx) {
+        for (const entry of durableQueue.entries) {
+            if (shuttingDown || entry.state !== "pending" || ingestedUpdateIds.has(entry.update.update_id))
+                continue;
+            ingestedUpdateIds.add(entry.update.update_id);
+            try {
+                await handleUpdate(entry.update, ctx);
+            }
+            catch {
+                await durableQueue.fail([entry.update.update_id]);
+                updateStatus(ctx, "Telegram message retained as failed; use /pitgram-retry.");
+            }
+        }
     }
     async function pollLoop(ctx, signal) {
-        if (!config.botToken)
+        if (!config.botToken || !durableQueue)
             return;
+        const queue = durableQueue;
+        try {
+            if (queue.lastUpdateId !== undefined)
+                config.lastUpdateId = queue.lastUpdateId;
+            await restorePendingUpdates(ctx);
+        }
+        catch {
+            ctx.ui.notify("Cannot restore durable Telegram queue. Polling stopped; stored messages preserved.", "error");
+            return;
+        }
         try {
             await callTelegram("deleteWebhook", { drop_pending_updates: false }, { signal });
         }
         catch {
             // ignore
-        }
-        if (config.lastUpdateId === undefined) {
-            try {
-                const updates = await callTelegram("getUpdates", { offset: -1, limit: 1, timeout: 0 }, { signal });
-                const last = updates.at(-1);
-                if (last) {
-                    config.lastUpdateId = last.update_id;
-                    await writeConfig(config);
-                }
-            }
-            catch {
-                // ignore
-            }
         }
         while (!signal.aborted) {
             try {
@@ -1238,11 +1336,17 @@ export default function (pi) {
                     timeout: 30,
                     allowed_updates: ["message", "edited_message"],
                 }, { signal });
-                for (const update of updates) {
-                    config.lastUpdateId = update.update_id;
+                if (signal.aborted || shuttingDown)
+                    return;
+                // The next getUpdates call acknowledges the previous offset. Commit
+                // the entire raw batch first, including media awaiting aggregation.
+                await queue.ingest(updates);
+                if (queue.lastUpdateId !== undefined) {
+                    config.lastUpdateId = queue.lastUpdateId;
                     await writeConfig(config);
-                    await handleUpdate(update, ctx);
                 }
+                await restorePendingUpdates(ctx);
+                dispatchNextTelegramTurn(ctx);
             }
             catch (error) {
                 if (signal.aborted)
@@ -1259,13 +1363,46 @@ export default function (pi) {
     async function startPolling(ctx) {
         if (!config.botToken || pollingPromise)
             return;
-        pollingController = new AbortController();
-        pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
-            pollingPromise = undefined;
-            pollingController = undefined;
+        if (pollingStartup)
+            return pollingStartup;
+        pollingStartup = (async () => {
+            const identity = String(config.botId ?? config.botToken.split(":")[0]);
+            if (durableQueue && durableBotIdentity !== identity) {
+                ctx.ui.notify("Restart Pi before changing bots; unfinished messages belong to the previous bot.", "error");
+                return;
+            }
+            if (!durableQueue) {
+                const queue = new DurableQueue(join(homedir(), ".pi", "agent", "pitgram", "queue"), identity);
+                try {
+                    await queue.load();
+                }
+                catch {
+                    await queue.close();
+                    ctx.ui.notify("Cannot open durable inbox. Another bridge may own this bot, or its queue needs repair. Polling stopped.", "error");
+                    return;
+                }
+                durableQueue = queue;
+                durableBotIdentity = identity;
+            }
+            if (shuttingDown) {
+                await durableQueue.close();
+                durableQueue = undefined;
+                return;
+            }
+            pollingController = new AbortController();
+            pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
+                pollingPromise = undefined;
+                pollingController = undefined;
+                updateStatus(ctx);
+            });
             updateStatus(ctx);
-        });
-        updateStatus(ctx);
+        })();
+        try {
+            await pollingStartup;
+        }
+        finally {
+            pollingStartup = undefined;
+        }
     }
     async function relayLoop(ctx, signal) {
         if (config.allowedUserId === undefined)
@@ -1399,8 +1536,30 @@ export default function (pi) {
                 `relay: ${relayPromise ? "running" : config.relayEnabled ? "enabled" : "disabled"}`,
                 `active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
                 `queued telegram turns: ${queuedTelegramTurns.length}`,
+                `durable inbox: ${durableQueue ? `pending=${durableQueue.counts.pending}, running=${durableQueue.counts.running}, failed=${durableQueue.counts.failed}` : "not open"}`,
+                `failed update ids: ${durableQueue?.entries.filter(entry => entry.state === "failed").map(entry => entry.update.update_id).join(", ") || "none"}`,
             ];
             ctx.ui.notify(status.join(" | "), "info");
+        },
+    });
+    pi.registerCommand("pitgram-retry", {
+        description: "Retry failed durable Telegram updates: <update-id> or all",
+        handler: async (args, ctx) => {
+            if (!durableQueue || config.relayEnabled) {
+                ctx.ui.notify("Connect direct polling before retrying its durable inbox.", "error");
+                return;
+            }
+            const input = args.trim();
+            if (input !== "all" && !/^\d+$/.test(input)) {
+                ctx.ui.notify("Usage: /pitgram-retry <update-id> or /pitgram-retry all", "info");
+                return;
+            }
+            const ids = await durableQueue.retry(input === "all" ? undefined : Number(input));
+            for (const id of ids)
+                ingestedUpdateIds.delete(id);
+            await restorePendingUpdates(ctx);
+            dispatchNextTelegramTurn(ctx);
+            ctx.ui.notify(`Retried ${ids.length} failed Telegram update(s).`, "info");
         },
     });
     pi.registerCommand("pitgram-connect", {
@@ -1429,6 +1588,8 @@ export default function (pi) {
             else {
                 await startPolling(ctx);
             }
+            if (!pollingPromise && !relayPromise)
+                return;
             updateStatus(ctx);
             ctx.ui.notify(`Pitgram bridge connected via ${config.relayEnabled ? "Telegram Serverless relay" : "direct polling"}. Bot: @${config.botUsername ?? "unknown"}${config.allowedUserId ? "" : " (awaiting pairing)"}`, "info");
         },
@@ -1488,6 +1649,11 @@ export default function (pi) {
     });
     pi.on("session_start", async (_event, ctx) => {
         await ensureRunnersPatched();
+        removeRuntimeErrorListener = activeRunner?.onError?.((error) => {
+            if (error.extensionPath === "<runtime>" && error.event === "send_user_message" && dispatchedTelegramTurn) {
+                void rejectDispatchedTurn(ctx);
+            }
+        });
         config = await readConfig();
         await mkdir(TEMP_DIR, { recursive: true });
         updateStatus(ctx);
@@ -1500,6 +1666,10 @@ export default function (pi) {
         }
     });
     pi.on("session_shutdown", async (_event, _ctx) => {
+        shuttingDown = true;
+        removeRuntimeErrorListener?.();
+        await stopRelay();
+        await stopPolling();
         if (dispatchTimer !== undefined)
             clearTimeout(dispatchTimer);
         dispatchTimer = undefined;
@@ -1511,14 +1681,14 @@ export default function (pi) {
                 clearTimeout(state.flushTimer);
         }
         mediaGroups.clear();
+        await Promise.allSettled([...durableMessageTasks]);
         if (activeTelegramTurn) {
             await clearPreview(activeTelegramTurn.chatId);
         }
         activeTelegramTurn = undefined;
         currentAbort = undefined;
         preserveQueuedTurnsAsHistory = false;
-        await stopRelay();
-        await stopPolling();
+        await durableQueue?.close();
     });
     pi.on("before_agent_start", async (event) => {
         // Match the actual dispatched prompt, never the [telegram] prefix alone.
@@ -1541,6 +1711,7 @@ export default function (pi) {
             if (nextTurn) {
                 dispatchedTelegramTurn = undefined;
                 activeTelegramTurn = { ...nextTurn };
+                lastTelegramResult = undefined;
                 previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
                 startTypingLoop(ctx);
             }
@@ -1565,60 +1736,93 @@ export default function (pi) {
         previewState.pendingText = getMessageText(event.message);
         schedulePreviewFlush(activeTelegramTurn.chatId);
     });
-    pi.on("agent_end", async (event, ctx) => {
+    pi.on("agent_end", (event) => {
+        if (activeTelegramTurn)
+            lastTelegramResult = extractAssistantText(event.messages);
+    });
+    async function finalizeTelegramTurn(ctx) {
         const turn = activeTelegramTurn;
-        matchedTelegramTurn = undefined;
-        currentAbort = undefined;
-        stopTypingLoop();
-        activeTelegramTurn = undefined;
-        updateStatus(ctx);
         if (!turn)
             return;
-        const assistant = extractAssistantText(event.messages);
-        if (assistant.stopReason === "aborted") {
-            await clearPreview(turn.chatId);
+        let completed = false;
+        try {
+            const assistant = lastTelegramResult ?? { stopReason: "error", errorMessage: "Telegram turn ended without a result." };
+            if (assistant.stopReason === "aborted") {
+                await clearPreview(turn.chatId);
+                if (turn.relayTurnId !== undefined) {
+                    await callRelay({ op: "error", chatId: turn.chatId, turnId: turn.relayTurnId, message: "aborted" }).catch(() => undefined);
+                }
+                return;
+            }
+            if (assistant.stopReason === "error") {
+                await clearPreview(turn.chatId);
+                const errorMessage = assistant.errorMessage || "Telegram bridge: pi failed while processing the request.";
+                await sendTextReply(turn.chatId, turn.replyToMessageId, errorMessage);
+                if (turn.relayTurnId !== undefined) {
+                    await callRelay({ op: "error", chatId: turn.chatId, turnId: turn.relayTurnId, message: errorMessage }).catch(() => undefined);
+                }
+                return;
+            }
+            const finalText = assistant.text;
+            if (previewState) {
+                previewState.pendingText = finalText ?? previewState.pendingText;
+            }
+            if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
+                const finalized = await finalizePreview(turn.chatId);
+                if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
+                    await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+                }
+            }
+            else {
+                await clearPreview(turn.chatId);
+                if (finalText) {
+                    await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+                }
+                else if (turn.queuedAttachments.length > 0) {
+                    await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+                }
+            }
+            await sendQueuedAttachments(turn);
             if (turn.relayTurnId !== undefined) {
-                await callRelay({ op: "error", chatId: turn.chatId, turnId: turn.relayTurnId, message: "aborted" }).catch(() => undefined);
+                await callRelay({ op: "done", chatId: turn.chatId, turnId: turn.relayTurnId }).catch(() => undefined);
             }
+            completed = true;
+        }
+        finally {
+            try {
+                if (!shuttingDown && turn.durableUpdateIds?.length) {
+                    if (completed)
+                        await durableQueue.complete(turn.durableUpdateIds);
+                    else
+                        await durableQueue.fail(turn.durableUpdateIds);
+                }
+            }
+            finally {
+                activeTelegramTurn = undefined;
+                lastTelegramResult = undefined;
+                matchedTelegramTurn = undefined;
+                currentAbort = undefined;
+                stopTypingLoop();
+                updateStatus(ctx);
+            }
+        }
+    }
+    pi.on("agent_settled", async (_event, ctx) => {
+        if (shuttingDown)
             return;
+        try {
+            await finalizeTelegramTurn(ctx);
         }
-        if (assistant.stopReason === "error") {
-            await clearPreview(turn.chatId);
-            const errorMessage = assistant.errorMessage || "Telegram bridge: pi failed while processing the request.";
-            await sendTextReply(turn.chatId, turn.replyToMessageId, errorMessage);
-            if (turn.relayTurnId !== undefined) {
-                await callRelay({ op: "error", chatId: turn.chatId, turnId: turn.relayTurnId, message: errorMessage }).catch(() => undefined);
-            }
-            return;
+        catch {
+            updateStatus(ctx, "Telegram delivery incomplete; message retained for retry or restart.");
         }
-        const finalText = assistant.text;
-        if (previewState) {
-            previewState.pendingText = finalText ?? previewState.pendingText;
-        }
-        if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
-            const finalized = await finalizePreview(turn.chatId);
-            if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
-                await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
-            }
-        }
-        else {
-            await clearPreview(turn.chatId);
-            if (finalText) {
-                await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
-            }
-            else if (turn.queuedAttachments.length > 0) {
-                await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
-            }
-        }
-        await sendQueuedAttachments(turn);
-        if (turn.relayTurnId !== undefined) {
-            await callRelay({ op: "done", chatId: turn.chatId, turnId: turn.relayTurnId }).catch(() => undefined);
-        }
-    });
-    pi.on("agent_settled", (_event, ctx) => {
         // agent_end can precede retry/compaction and the runtime is still processing.
         // Schedule outside the notification-only settled handler, then recheck idle.
-        if (dispatchTimer !== undefined || queuedTelegramTurns.length === 0)
+        if (queuedTelegramTurns.length === 0) {
+            await closeIdleDurableQueue();
+            return;
+        }
+        if (dispatchTimer !== undefined)
             return;
         dispatchTimer = setTimeout(() => {
             dispatchTimer = undefined;
