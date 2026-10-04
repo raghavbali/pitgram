@@ -282,6 +282,8 @@ export default function (pi) {
     let durableQueue;
     let durableBotIdentity;
     const durableMessageTasks = new Set();
+    const pendingControlTasks = new Set();
+    const deferredControlTimers = new Map();
     const ingestedUpdateIds = new Set();
     let shuttingDown = false;
     let dispatchedTelegramTurn;
@@ -301,7 +303,7 @@ export default function (pi) {
     let sessionCache = [];
     let modelCache = [];
     function dispatchNextTelegramTurn(ctx) {
-        if (shuttingDown || activeTelegramTurn || dispatchedTelegramTurn || preserveQueuedTurnsAsHistory || !ctx.isIdle())
+        if (shuttingDown || activeTelegramTurn || dispatchedTelegramTurn || preserveQueuedTurnsAsHistory || pendingControlTasks.size || deferredControlTimers.size || !ctx.isIdle())
             return;
         const turn = queuedTelegramTurns[0];
         if (!turn)
@@ -748,13 +750,33 @@ export default function (pi) {
         await closeIdleDurableQueue();
     }
     async function closeIdleDurableQueue() {
-        if (pollingPromise || pollingStartup || activeTelegramTurn || dispatchedTelegramTurn || queuedTelegramTurns.length || mediaGroups.size || durableMessageTasks.size)
+        if (pollingPromise || pollingStartup || activeTelegramTurn || dispatchedTelegramTurn || queuedTelegramTurns.length || mediaGroups.size || durableMessageTasks.size || pendingControlTasks.size || deferredControlTimers.size)
             return;
         const queue = durableQueue;
         durableQueue = undefined;
         durableBotIdentity = undefined;
         ingestedUpdateIds.clear();
         await queue?.close();
+    }
+    function deferControlToNextTick(operation) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                deferredControlTimers.delete(timer);
+                if (shuttingDown) {
+                    resolve();
+                    return;
+                }
+                void operation().then(resolve, reject);
+            }, 0);
+            deferredControlTimers.set(timer, resolve);
+        });
+    }
+    function cancelDeferredControlTimers() {
+        for (const [timer, resolve] of deferredControlTimers) {
+            clearTimeout(timer);
+            resolve();
+        }
+        deferredControlTimers.clear();
     }
     function formatTelegramHistoryText(rawText, files) {
         let summary = rawText.length > 0 ? rawText : "(no text)";
@@ -900,17 +922,43 @@ export default function (pi) {
                 await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
                 return;
             }
-            ctx.compact({
-                onComplete: () => {
-                    void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
-                },
-                onError: (error) => {
-                    const message = error instanceof Error ? error.message : String(error);
-                    void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
-                },
-            });
             await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
-            return;
+            return {
+                kind: "deferred-control",
+                run: () => new Promise((resolve, reject) => {
+                    if (shuttingDown) {
+                        resolve();
+                        return;
+                    }
+                    ctx.compact({
+                        onComplete: async () => {
+                            if (shuttingDown) {
+                                resolve();
+                                return;
+                            }
+                            try {
+                                await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
+                                resolve();
+                            }
+                            catch (error) {
+                                reject(error);
+                            }
+                        },
+                        onError: async (error) => {
+                            if (shuttingDown) {
+                                resolve();
+                                return;
+                            }
+                            const message = error instanceof Error ? error.message : String(error);
+                            try {
+                                await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
+                            }
+                            catch { /* The failed control remains in the durable inbox. */ }
+                            reject(error);
+                        },
+                    });
+                }),
+            };
         }
         if (lower === "/sessions") {
             try {
@@ -936,44 +984,48 @@ export default function (pi) {
         }
         if (lower.startsWith("/new")) {
             const name = rawText.slice(4).trim();
-            void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Starting a new session${name ? ` "${name}"` : ""}...`).catch(() => undefined);
-            setTimeout(async () => {
-                try {
-                    await ensureRunnersPatched();
-                    const cmdCtx = activeRunner ? activeRunner.createCommandContext() : ctx;
-                    if (typeof cmdCtx.newSession !== "function") {
-                        const diag = `activeRunner=${!!activeRunner}, keys=${Object.keys(cmdCtx).join(",")}`;
-                        throw new Error(`cmdCtx.newSession is not a function in current context (${diag})`);
-                    }
-                    await cmdCtx.newSession({
-                        setup: async (sm) => {
-                            if (name) {
-                                sm.appendSessionInfo(name);
-                            }
-                        },
-                        withSession: async (newCtx) => {
-                            const actualName = name || newCtx.sessionManager.getSessionName() || newCtx.sessionManager.getSessionId();
-                            await callTelegram("sendMessage", {
-                                chat_id: firstMessage.chat.id,
-                                text: `New session started: ${actualName}`,
-                            });
-                        }
-                    });
-                }
-                catch (error) {
-                    const msg = error instanceof Error ? error.message : String(error);
+            await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Starting a new session${name ? ` "${name}"` : ""}...`);
+            return {
+                kind: "deferred-control",
+                run: () => deferControlToNextTick(async () => {
                     try {
-                        await callTelegram("sendMessage", {
-                            chat_id: firstMessage.chat.id,
-                            text: `Failed to create new session: ${msg}`,
+                        if (shuttingDown)
+                            return;
+                        await ensureRunnersPatched();
+                        if (shuttingDown)
+                            return;
+                        const cmdCtx = activeRunner ? activeRunner.createCommandContext() : ctx;
+                        if (typeof cmdCtx.newSession !== "function") {
+                            const diag = `activeRunner=${!!activeRunner}, keys=${Object.keys(cmdCtx).join(",")}`;
+                            throw new Error(`cmdCtx.newSession is not a function in current context (${diag})`);
+                        }
+                        const result = await cmdCtx.newSession({
+                            setup: async (sm) => {
+                                if (name) {
+                                    sm.appendSessionInfo(name);
+                                }
+                            },
+                            withSession: async (newCtx) => {
+                                if (shuttingDown)
+                                    return;
+                                const actualName = name || newCtx.sessionManager.getSessionName() || newCtx.sessionManager.getSessionId();
+                                await callTelegram("sendMessage", {
+                                    chat_id: firstMessage.chat.id,
+                                    text: `New session started: ${actualName}`,
+                                });
+                            }
                         });
+                        if (result?.cancelled)
+                            throw new Error("New session was cancelled.");
                     }
-                    catch {
-                        // ignore
+                    catch (error) {
+                        const msg = error instanceof Error ? error.message : String(error);
+                        if (!shuttingDown)
+                            await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Failed to create new session: ${msg}`);
+                        throw error;
                     }
-                }
-            }, 0);
-            return;
+                }),
+            };
         }
         if (lower.startsWith("/switch ")) {
             const arg = rawText.slice(8).trim();
@@ -985,39 +1037,43 @@ export default function (pi) {
             else {
                 targetPath = arg;
             }
-            void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Switching to session: ${targetPath}...`).catch(() => undefined);
-            setTimeout(async () => {
-                try {
-                    await ensureRunnersPatched();
-                    const cmdCtx = activeRunner ? activeRunner.createCommandContext() : ctx;
-                    if (typeof cmdCtx.switchSession !== "function") {
-                        const diag = `activeRunner=${!!activeRunner}, keys=${Object.keys(cmdCtx).join(",")}`;
-                        throw new Error(`cmdCtx.switchSession is not a function in current context (${diag})`);
-                    }
-                    await cmdCtx.switchSession(targetPath, {
-                        withSession: async (newCtx) => {
-                            const sessionName = newCtx.sessionManager.getSessionName() || basename(targetPath);
-                            await callTelegram("sendMessage", {
-                                chat_id: firstMessage.chat.id,
-                                text: `Successfully switched to session: ${sessionName}`,
-                            });
-                        }
-                    });
-                }
-                catch (error) {
-                    const msg = error instanceof Error ? error.message : String(error);
+            await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Switching to session: ${targetPath}...`);
+            return {
+                kind: "deferred-control",
+                run: () => deferControlToNextTick(async () => {
                     try {
-                        await callTelegram("sendMessage", {
-                            chat_id: firstMessage.chat.id,
-                            text: `Failed to switch session: ${msg}`,
+                        if (shuttingDown)
+                            return;
+                        await ensureRunnersPatched();
+                        if (shuttingDown)
+                            return;
+                        const cmdCtx = activeRunner ? activeRunner.createCommandContext() : ctx;
+                        if (typeof cmdCtx.switchSession !== "function") {
+                            const diag = `activeRunner=${!!activeRunner}, keys=${Object.keys(cmdCtx).join(",")}`;
+                            throw new Error(`cmdCtx.switchSession is not a function in current context (${diag})`);
+                        }
+                        const result = await cmdCtx.switchSession(targetPath, {
+                            withSession: async (newCtx) => {
+                                if (shuttingDown)
+                                    return;
+                                const sessionName = newCtx.sessionManager.getSessionName() || basename(targetPath);
+                                await callTelegram("sendMessage", {
+                                    chat_id: firstMessage.chat.id,
+                                    text: `Successfully switched to session: ${sessionName}`,
+                                });
+                            }
                         });
+                        if (result?.cancelled)
+                            throw new Error("Session switch was cancelled.");
                     }
-                    catch {
-                        // ignore
+                    catch (error) {
+                        const msg = error instanceof Error ? error.message : String(error);
+                        if (!shuttingDown)
+                            await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Failed to switch session: ${msg}`);
+                        throw error;
                     }
-                }
-            }, 0);
-            return;
+                }),
+            };
         }
         if (lower === "/fork" || lower === "/clone") {
             const leafId = ctx.sessionManager.getLeafId();
@@ -1025,40 +1081,44 @@ export default function (pi) {
                 void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot fork an empty session.").catch(() => undefined);
                 return;
             }
-            void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Forking current session...").catch(() => undefined);
-            setTimeout(async () => {
-                try {
-                    await ensureRunnersPatched();
-                    const cmdCtx = activeRunner ? activeRunner.createCommandContext() : ctx;
-                    if (typeof cmdCtx.fork !== "function") {
-                        const diag = `activeRunner=${!!activeRunner}, keys=${Object.keys(cmdCtx).join(",")}`;
-                        throw new Error(`cmdCtx.fork is not a function in current context (${diag})`);
-                    }
-                    await cmdCtx.fork(leafId, {
-                        position: "at",
-                        withSession: async (newCtx) => {
-                            const newSessionId = newCtx.sessionManager.getSessionId();
-                            await callTelegram("sendMessage", {
-                                chat_id: firstMessage.chat.id,
-                                text: `Session successfully forked! New Session ID: ${newSessionId}`,
-                            });
-                        }
-                    });
-                }
-                catch (error) {
-                    const msg = error instanceof Error ? error.message : String(error);
+            await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Forking current session...");
+            return {
+                kind: "deferred-control",
+                run: () => deferControlToNextTick(async () => {
                     try {
-                        await callTelegram("sendMessage", {
-                            chat_id: firstMessage.chat.id,
-                            text: `Failed to fork session: ${msg}`,
+                        if (shuttingDown)
+                            return;
+                        await ensureRunnersPatched();
+                        if (shuttingDown)
+                            return;
+                        const cmdCtx = activeRunner ? activeRunner.createCommandContext() : ctx;
+                        if (typeof cmdCtx.fork !== "function") {
+                            const diag = `activeRunner=${!!activeRunner}, keys=${Object.keys(cmdCtx).join(",")}`;
+                            throw new Error(`cmdCtx.fork is not a function in current context (${diag})`);
+                        }
+                        const result = await cmdCtx.fork(leafId, {
+                            position: "at",
+                            withSession: async (newCtx) => {
+                                if (shuttingDown)
+                                    return;
+                                const newSessionId = newCtx.sessionManager.getSessionId();
+                                await callTelegram("sendMessage", {
+                                    chat_id: firstMessage.chat.id,
+                                    text: `Session successfully forked! New Session ID: ${newSessionId}`,
+                                });
+                            }
                         });
+                        if (result?.cancelled)
+                            throw new Error("Session fork was cancelled.");
                     }
-                    catch {
-                        // ignore
+                    catch (error) {
+                        const msg = error instanceof Error ? error.message : String(error);
+                        if (!shuttingDown)
+                            await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Failed to fork session: ${msg}`);
+                        throw error;
                     }
-                }
-            }, 0);
-            return;
+                }),
+            };
         }
         if (lower === "/status") {
             let totalInput = 0;
@@ -1237,9 +1297,41 @@ export default function (pi) {
     async function processDurableMessages(messages, updateIds, ctx) {
         const task = (async () => {
             try {
+                const queue = durableQueue;
                 const turn = await dispatchAuthorizedTelegramMessages(messages, ctx, updateIds);
-                if (!turn)
-                    await durableQueue.complete(updateIds);
+                if (turn && "kind" in turn && turn.kind === "deferred-control") {
+                    let controlTask;
+                    controlTask = (async () => {
+                        try {
+                            await queue.running(updateIds);
+                            if (shuttingDown || durableQueue !== queue)
+                                return;
+                            await turn.run();
+                            if (!shuttingDown && durableQueue === queue)
+                                await queue.complete(updateIds);
+                        }
+                        catch {
+                            if (!shuttingDown && durableQueue === queue) {
+                                await queue.fail(updateIds).catch(() => undefined);
+                                updateStatus(ctx, "Telegram control failed and was retained; use /pitgram-retry.");
+                            }
+                        }
+                        finally {
+                            pendingControlTasks.delete(controlTask);
+                            if (!shuttingDown && pendingControlTasks.size === 0 && deferredControlTimers.size === 0 && queuedTelegramTurns.length > 0 && dispatchTimer === undefined) {
+                                dispatchTimer = setTimeout(() => {
+                                    dispatchTimer = undefined;
+                                    dispatchNextTelegramTurn(ctx);
+                                }, 0);
+                            }
+                            void closeIdleDurableQueue();
+                        }
+                    })();
+                    pendingControlTasks.add(controlTask);
+                }
+                else if (!turn) {
+                    await queue.complete(updateIds);
+                }
             }
             catch {
                 await durableQueue.fail(updateIds);
@@ -1667,6 +1759,7 @@ export default function (pi) {
     });
     pi.on("session_shutdown", async (_event, _ctx) => {
         shuttingDown = true;
+        cancelDeferredControlTimers();
         removeRuntimeErrorListener?.();
         await stopRelay();
         await stopPolling();

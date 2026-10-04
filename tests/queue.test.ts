@@ -23,8 +23,15 @@ async function eventually(predicate: () => boolean) {
   }
   assert.fail("Timed out waiting for mocked dispatch");
 }
+async function eventuallyAsync(predicate: () => Promise<boolean>) {
+  for (let i = 0; i < 200; i++) {
+    if (await predicate()) return;
+    await pause(5);
+  }
+  assert.fail("Timed out waiting for mocked durable state");
+}
 
-async function fixture(initialIdle = true, count = 2, recover = false) {
+async function fixture(initialIdle = true, count = 2, recover = false, textOverrides: string[] = [], waitForDispatch = true) {
   if (!recover) await rm(join(testHome, ".pi", "agent", "pitgram"), { recursive: true, force: true });
   await writeFile(join(testHome, ".pi", "agent", "telegram.json"), JSON.stringify({
     botToken: "TEST_TOKEN", allowedUserId: 42, lastUpdateId: 100,
@@ -35,6 +42,8 @@ async function fixture(initialIdle = true, count = 2, recover = false) {
   const commands = new Map<string, any>();
   const notifications: string[] = [];
   const sent: any[] = [];
+  const replies: string[] = [];
+  let compactOptions: any;
   let idle = initialIdle;
   let batchReturned = false;
   let backlogFetched = false;
@@ -50,7 +59,7 @@ async function fixture(initialIdle = true, count = 2, recover = false) {
           update_id: 101 + i,
           message: { message_id: 201 + i, date: 1700000000 + i,
             chat: { id: 42, type: "private" }, from: { id: 42 },
-            text: `offline-retention-test ${i === 0 ? "A" : "B"}` },
+            text: textOverrides[i] ?? `offline-retention-test ${i === 0 ? "A" : "B"}` },
         }));
       } else {
         backlogFetched = recover ? body.offset > 100 : body.offset === 101 + count;
@@ -66,12 +75,14 @@ async function fixture(initialIdle = true, count = 2, recover = false) {
         result = [];
       }
     } else if (method === "sendMessage" || method === "sendMessageDraft") {
+      if (body.text) replies.push(body.text);
       result = { message_id: 500 };
     } else assert.ok(["deleteWebhook", "sendChatAction"].includes(method!));
     return { ok: true, json: async () => ({ ok: true, result }) } as Response;
   }) as typeof fetch;
   const ctx: any = {
     mode: "tui", isIdle: () => idle, abort() {},
+    compact(options: any) { compactOptions = options; },
     ui: { setStatus() {}, notify(text: string) { notifications.push(text); }, theme: { fg: (_name: string, text: string) => text } },
   };
   pitgram({
@@ -86,9 +97,10 @@ async function fixture(initialIdle = true, count = 2, recover = false) {
   } as any);
   await handlers.get("session_start")({}, ctx);
   await eventually(() => backlogFetched);
-  if (initialIdle) await eventually(() => sent.length === 1);
+  if (initialIdle && waitForDispatch) await eventually(() => sent.length === 1);
   return {
-    handlers, sent, ctx, notifications,
+    handlers, sent, ctx, notifications, replies,
+    compactOptions: () => compactOptions,
     async command(name: string, args = "") { await commands.get(name).handler(args, ctx); },
     async source() { return (await tools.get("pitgram_context").execute("test", {})).details; },
     async start(index: number) {
@@ -110,6 +122,37 @@ async function fixture(initialIdle = true, count = 2, recover = false) {
     },
   };
 }
+
+test("deferred compaction keeps its raw update running until its completion callback and reply", async () => {
+  const app = await fixture(true, 1, false, ["/compact"], false);
+  try {
+    await eventually(() => !!app.compactOptions());
+    assert.equal((await stored()).entries[0].state, "running");
+    assert.ok(app.replies.includes("Compaction started."));
+    await app.compactOptions().onComplete();
+    await eventuallyAsync(async () => (await stored()).entries.length === 0);
+    assert.ok(app.replies.includes("Compaction completed."));
+  } finally { await app.close(); }
+});
+
+test("deferred compaction errors retain the raw update for explicit retry", async () => {
+  const app = await fixture(true, 1, false, ["/compact"], false);
+  try {
+    await eventually(() => !!app.compactOptions());
+    await app.compactOptions().onError(new Error("fixture compaction failure"));
+    await eventuallyAsync(async () => (await stored()).entries[0]?.state === "failed");
+    assert.ok(app.replies.includes("Compaction failed: fixture compaction failure"));
+  } finally { await app.close(); }
+});
+
+test("shutdown cancels deferred session-control timers and retains their raw updates", async () => {
+  const app = await fixture(true, 1, false, ["/new after restart"], false);
+  try {
+    await eventually(() => app.replies.some(text => text.startsWith("Starting a new session")));
+    await app.close();
+    assert.equal((await stored()).entries[0].state, "running");
+  } finally { await rm(join(testHome, ".pi", "agent", "pitgram"), { recursive: true, force: true }); }
+});
 
 test("one offline batch reserves the first prompt through preflight, then delivers FIFO only after settlement", async () => {
   const app = await fixture();

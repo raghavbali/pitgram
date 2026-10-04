@@ -237,6 +237,11 @@ interface PendingTelegramTurn {
 	durableUpdateIds?: number[];
 }
 
+interface DeferredTelegramControl {
+	kind: "deferred-control";
+	run(): Promise<void>;
+}
+
 type ActiveTelegramTurn = PendingTelegramTurn;
 
 interface QueuedAttachment {
@@ -481,6 +486,8 @@ export default function (pi: ExtensionAPI) {
 	let durableQueue: DurableQueue<TelegramUpdate> | undefined;
 	let durableBotIdentity: string | undefined;
 	const durableMessageTasks = new Set<Promise<void>>();
+	const pendingControlTasks = new Set<Promise<void>>();
+	const deferredControlTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
 	const ingestedUpdateIds = new Set<number>();
 	let shuttingDown = false;
 	let dispatchedTelegramTurn: PendingTelegramTurn | undefined;
@@ -501,7 +508,7 @@ export default function (pi: ExtensionAPI) {
 	let modelCache: any[] = [];
 
 	function dispatchNextTelegramTurn(ctx: ExtensionContext): void {
-		if (shuttingDown || activeTelegramTurn || dispatchedTelegramTurn || preserveQueuedTurnsAsHistory || !ctx.isIdle()) return;
+		if (shuttingDown || activeTelegramTurn || dispatchedTelegramTurn || preserveQueuedTurnsAsHistory || pendingControlTasks.size || deferredControlTimers.size || !ctx.isIdle()) return;
 		const turn = queuedTelegramTurns[0];
 		if (!turn) return;
 		// Pi's prompt preflight is asynchronous: isIdle() may stay true after submission.
@@ -963,12 +970,31 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function closeIdleDurableQueue(): Promise<void> {
-		if (pollingPromise || pollingStartup || activeTelegramTurn || dispatchedTelegramTurn || queuedTelegramTurns.length || mediaGroups.size || durableMessageTasks.size) return;
+		if (pollingPromise || pollingStartup || activeTelegramTurn || dispatchedTelegramTurn || queuedTelegramTurns.length || mediaGroups.size || durableMessageTasks.size || pendingControlTasks.size || deferredControlTimers.size) return;
 		const queue = durableQueue;
 		durableQueue = undefined;
 		durableBotIdentity = undefined;
 		ingestedUpdateIds.clear();
 		await queue?.close();
+	}
+
+	function deferControlToNextTick(operation: () => Promise<void>): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				deferredControlTimers.delete(timer);
+				if (shuttingDown) { resolve(); return; }
+				void operation().then(resolve, reject);
+			}, 0);
+			deferredControlTimers.set(timer, resolve);
+		});
+	}
+
+	function cancelDeferredControlTimers(): void {
+		for (const [timer, resolve] of deferredControlTimers) {
+			clearTimeout(timer);
+			resolve();
+		}
+		deferredControlTimers.clear();
 	}
 
 	function formatTelegramHistoryText(rawText: string, files: DownloadedTelegramFile[]): string {
@@ -1096,7 +1122,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext, updateIds: number[] = []): Promise<PendingTelegramTurn | undefined> {
+	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext, updateIds: number[] = []): Promise<PendingTelegramTurn | DeferredTelegramControl | undefined> {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
@@ -1121,17 +1147,27 @@ export default function (pi: ExtensionAPI) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
 				return;
 			}
-			ctx.compact({
-				onComplete: () => {
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
-				},
-				onError: (error) => {
-					const message = error instanceof Error ? error.message : String(error);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
-				},
-			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
-			return;
+			return {
+				kind: "deferred-control",
+				run: () => new Promise<void>((resolve, reject) => {
+					if (shuttingDown) { resolve(); return; }
+					ctx.compact({
+						onComplete: async () => {
+							if (shuttingDown) { resolve(); return; }
+							try { await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed."); resolve(); }
+							catch (error) { reject(error); }
+						},
+						onError: async (error) => {
+							if (shuttingDown) { resolve(); return; }
+							const message = error instanceof Error ? error.message : String(error);
+							try { await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`); }
+							catch { /* The failed control remains in the durable inbox. */ }
+							reject(error);
+						},
+					});
+				}),
+			};
 		}
 
 		if (lower === "/sessions") {
@@ -1158,22 +1194,27 @@ export default function (pi: ExtensionAPI) {
 
 		if (lower.startsWith("/new")) {
 			const name = rawText.slice(4).trim();
-			void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Starting a new session${name ? ` "${name}"` : ""}...`).catch(() => undefined);
-			setTimeout(async () => {
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Starting a new session${name ? ` "${name}"` : ""}...`);
+			return {
+				kind: "deferred-control",
+				run: () => deferControlToNextTick(async () => {
 				try {
+					if (shuttingDown) return;
 					await ensureRunnersPatched();
+					if (shuttingDown) return;
 					const cmdCtx = activeRunner ? activeRunner.createCommandContext() : (ctx as ExtensionCommandContext);
 					if (typeof cmdCtx.newSession !== "function") {
 						const diag = `activeRunner=${!!activeRunner}, keys=${Object.keys(cmdCtx).join(",")}`;
 						throw new Error(`cmdCtx.newSession is not a function in current context (${diag})`);
 					}
-					await cmdCtx.newSession({
+					const result = await cmdCtx.newSession({
 						setup: async (sm: any) => {
 							if (name) {
 								sm.appendSessionInfo(name);
 							}
 						},
 						withSession: async (newCtx: any) => {
+							if (shuttingDown) return;
 							const actualName = name || newCtx.sessionManager.getSessionName() || newCtx.sessionManager.getSessionId();
 							await callTelegram("sendMessage", {
 								chat_id: firstMessage.chat.id,
@@ -1181,19 +1222,14 @@ export default function (pi: ExtensionAPI) {
 							});
 						}
 					});
+					if (result?.cancelled) throw new Error("New session was cancelled.");
 				} catch (error) {
 					const msg = error instanceof Error ? error.message : String(error);
-					try {
-						await callTelegram("sendMessage", {
-							chat_id: firstMessage.chat.id,
-							text: `Failed to create new session: ${msg}`,
-						});
-					} catch {
-						// ignore
-					}
+					if (!shuttingDown) await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Failed to create new session: ${msg}`);
+					throw error;
 				}
-			}, 0);
-			return;
+				}),
+			};
 		}
 
 		if (lower.startsWith("/switch ")) {
@@ -1206,17 +1242,22 @@ export default function (pi: ExtensionAPI) {
 				targetPath = arg;
 			}
 
-			void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Switching to session: ${targetPath}...`).catch(() => undefined);
-			setTimeout(async () => {
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Switching to session: ${targetPath}...`);
+			return {
+				kind: "deferred-control",
+				run: () => deferControlToNextTick(async () => {
 				try {
+					if (shuttingDown) return;
 					await ensureRunnersPatched();
+					if (shuttingDown) return;
 					const cmdCtx = activeRunner ? activeRunner.createCommandContext() : (ctx as ExtensionCommandContext);
 					if (typeof cmdCtx.switchSession !== "function") {
 						const diag = `activeRunner=${!!activeRunner}, keys=${Object.keys(cmdCtx).join(",")}`;
 						throw new Error(`cmdCtx.switchSession is not a function in current context (${diag})`);
 					}
-					await cmdCtx.switchSession(targetPath, {
+					const result = await cmdCtx.switchSession(targetPath, {
 						withSession: async (newCtx: any) => {
+							if (shuttingDown) return;
 							const sessionName = newCtx.sessionManager.getSessionName() || basename(targetPath);
 							await callTelegram("sendMessage", {
 								chat_id: firstMessage.chat.id,
@@ -1224,19 +1265,14 @@ export default function (pi: ExtensionAPI) {
 							});
 						}
 					});
+					if (result?.cancelled) throw new Error("Session switch was cancelled.");
 				} catch (error) {
 					const msg = error instanceof Error ? error.message : String(error);
-					try {
-						await callTelegram("sendMessage", {
-							chat_id: firstMessage.chat.id,
-							text: `Failed to switch session: ${msg}`,
-						});
-					} catch {
-						// ignore
-					}
+					if (!shuttingDown) await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Failed to switch session: ${msg}`);
+					throw error;
 				}
-			}, 0);
-			return;
+				}),
+			};
 		}
 
 		if (lower === "/fork" || lower === "/clone") {
@@ -1245,18 +1281,23 @@ export default function (pi: ExtensionAPI) {
 				void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot fork an empty session.").catch(() => undefined);
 				return;
 			}
-			void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Forking current session...").catch(() => undefined);
-			setTimeout(async () => {
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Forking current session...");
+			return {
+				kind: "deferred-control",
+				run: () => deferControlToNextTick(async () => {
 				try {
+					if (shuttingDown) return;
 					await ensureRunnersPatched();
+					if (shuttingDown) return;
 					const cmdCtx = activeRunner ? activeRunner.createCommandContext() : (ctx as ExtensionCommandContext);
 					if (typeof cmdCtx.fork !== "function") {
 						const diag = `activeRunner=${!!activeRunner}, keys=${Object.keys(cmdCtx).join(",")}`;
 						throw new Error(`cmdCtx.fork is not a function in current context (${diag})`);
 					}
-					await cmdCtx.fork(leafId, {
+					const result = await cmdCtx.fork(leafId, {
 						position: "at",
 						withSession: async (newCtx: any) => {
+							if (shuttingDown) return;
 							const newSessionId = newCtx.sessionManager.getSessionId();
 							await callTelegram("sendMessage", {
 								chat_id: firstMessage.chat.id,
@@ -1264,19 +1305,14 @@ export default function (pi: ExtensionAPI) {
 							});
 						}
 					});
+					if (result?.cancelled) throw new Error("Session fork was cancelled.");
 				} catch (error) {
 					const msg = error instanceof Error ? error.message : String(error);
-					try {
-						await callTelegram("sendMessage", {
-							chat_id: firstMessage.chat.id,
-							text: `Failed to fork session: ${msg}`,
-						});
-					} catch {
-						// ignore
-					}
+					if (!shuttingDown) await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Failed to fork session: ${msg}`);
+					throw error;
 				}
-			}, 0);
-			return;
+				}),
+			};
 		}
 
 		if (lower === "/status") {
@@ -1467,8 +1503,36 @@ export default function (pi: ExtensionAPI) {
 	async function processDurableMessages(messages: TelegramMessage[], updateIds: number[], ctx: ExtensionContext): Promise<void> {
 		const task = (async () => {
 			try {
+				const queue = durableQueue!;
 				const turn = await dispatchAuthorizedTelegramMessages(messages, ctx, updateIds);
-				if (!turn) await durableQueue!.complete(updateIds);
+				if (turn && "kind" in turn && turn.kind === "deferred-control") {
+					let controlTask!: Promise<void>;
+					controlTask = (async () => {
+						try {
+							await queue.running(updateIds);
+							if (shuttingDown || durableQueue !== queue) return;
+							await turn.run();
+							if (!shuttingDown && durableQueue === queue) await queue.complete(updateIds);
+						} catch {
+							if (!shuttingDown && durableQueue === queue) {
+								await queue.fail(updateIds).catch(() => undefined);
+								updateStatus(ctx, "Telegram control failed and was retained; use /pitgram-retry.");
+							}
+						} finally {
+							pendingControlTasks.delete(controlTask);
+							if (!shuttingDown && pendingControlTasks.size === 0 && deferredControlTimers.size === 0 && queuedTelegramTurns.length > 0 && dispatchTimer === undefined) {
+								dispatchTimer = setTimeout(() => {
+									dispatchTimer = undefined;
+								dispatchNextTelegramTurn(ctx);
+								}, 0);
+							}
+							void closeIdleDurableQueue();
+						}
+					})();
+					pendingControlTasks.add(controlTask);
+				} else if (!turn) {
+					await queue.complete(updateIds);
+				}
 			} catch {
 				await durableQueue!.fail(updateIds);
 				updateStatus(ctx, "Telegram message retained as failed; use /pitgram-retry.");
@@ -1879,6 +1943,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		shuttingDown = true;
+		cancelDeferredControlTimers();
 		removeRuntimeErrorListener?.();
 		await stopRelay();
 		await stopPolling();
