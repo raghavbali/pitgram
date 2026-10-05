@@ -155,6 +155,7 @@ interface TelegramVoice {
 	file_id: string;
 	mime_type?: string;
 	file_size?: number;
+	duration?: number;
 }
 
 interface TelegramAnimation {
@@ -222,8 +223,9 @@ interface TelegramSourceContext {
 	messageId: number | null;
 	relayTurnId: number | null;
 	timestamp: number | null;
-	attachments: Array<{ path: string; fileName: string; mimeType: string | null; temporary: true }>;
+	attachments: Array<{ path: string; fileName: string; mimeType: string | null; temporary: true; mediaKind?: "voice"; durationSeconds?: number | null }>;
 	typedCaptureSupported: boolean;
+	voiceCaptureSupported: boolean;
 }
 
 interface PendingTelegramTurn {
@@ -280,6 +282,7 @@ interface RelayTurn {
 		date?: number;
 		text?: string;
 		hasMedia?: boolean;
+		voice?: { mimeType: "audio/ogg"; durationSeconds: number | null };
 	};
 	attachments?: RelayAttachment[];
 }
@@ -1016,6 +1019,14 @@ export default function (pi: ExtensionAPI) {
 		if (!firstMessage) throw new Error("Missing Telegram message for turn creation");
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).filter(Boolean).join("\n\n");
 		const files = await buildTelegramFiles(messages);
+		const voiceMessage = messages.length === 1 ? firstMessage : undefined;
+		const voiceDuration = voiceMessage?.voice?.duration;
+		const validVoiceDuration = voiceDuration === undefined || (Number.isSafeInteger(voiceDuration) && voiceDuration >= 0);
+		const voiceFile = voiceMessage?.voice && validVoiceDuration && !voiceMessage.text && !voiceMessage.caption && !voiceMessage.media_group_id
+			&& !voiceMessage.photo && !voiceMessage.document && !voiceMessage.video && !voiceMessage.audio
+			&& !voiceMessage.animation && !voiceMessage.sticker && files.length === 1 && files[0].isImage === false ? files[0] : undefined;
+		const voiceMimeType = voiceMessage?.voice?.mime_type ?? "audio/ogg";
+		const voiceCaptureSupported = Boolean(voiceFile && voiceMimeType === "audio/ogg");
 		const content: Array<TextContent | ImageContent> = [];
 		let prompt = `${TELEGRAM_PREFIX}`;
 
@@ -1059,8 +1070,10 @@ export default function (pi: ExtensionAPI) {
 				messageId: firstMessage.message_id,
 				relayTurnId: null,
 				timestamp: firstMessage.date ?? null,
-				attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: file.mimeType ?? null, temporary: true })),
+				attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: voiceCaptureSupported ? "audio/ogg" : file.mimeType ?? null, temporary: true as const,
+					...(voiceCaptureSupported ? { mediaKind: "voice" as const, durationSeconds: voiceMessage?.voice?.duration ?? null } : {}) })),
 				typedCaptureSupported: messages.length === 1 && firstMessage.text !== undefined && files.length === 0,
+				voiceCaptureSupported,
 			},
 			chatId: firstMessage.chat.id,
 			replyToMessageId: firstMessage.message_id,
@@ -1071,7 +1084,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function createRelayTelegramTurn(turn: RelayTurn): Promise<PendingTelegramTurn> {
-		const rawText = (turn.userText || turn.payload?.text || "").trim();
+		const sourceText = turn.userText ?? turn.payload?.text ?? "";
+		const rawText = sourceText.trim();
+		const sourceTextIsEmpty = (turn.userText === undefined || turn.userText === "")
+			&& (turn.payload?.text === undefined || turn.payload.text === "");
 		const files: DownloadedTelegramFile[] = [];
 		for (const [index, attachment] of (turn.attachments ?? []).entries()) {
 			const fallback = `attachment-${turn.id}-${index + 1}${guessExtensionFromMime(attachment.mimeType, "")}`;
@@ -1084,6 +1100,12 @@ export default function (pi: ExtensionAPI) {
 				isImage: attachment.isImage ?? isImageMimeType(attachment.mimeType),
 			});
 		}
+		const relayVoice = turn.payload?.voice;
+		const relayDuration = relayVoice?.durationSeconds;
+		const validRelayDuration = relayDuration === null || (typeof relayDuration === "number" && Number.isSafeInteger(relayDuration) && relayDuration >= 0);
+		const voiceCaptureSupported = Boolean(relayVoice && relayVoice.mimeType === "audio/ogg" && validRelayDuration
+			&& files.length === 1 && files[0].isImage === false && files[0].mimeType === "audio/ogg" && sourceTextIsEmpty
+			&& turn.payload?.hasMedia === true);
 
 		let prompt = `${TELEGRAM_PREFIX} ${rawText || "(no text)"}`;
 		if (files.length > 0) {
@@ -1109,9 +1131,11 @@ export default function (pi: ExtensionAPI) {
 					? turn.payload.messageId : null,
 				relayTurnId: turn.id,
 				timestamp: turn.payload?.date ?? null,
-				attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: file.mimeType ?? null, temporary: true })),
+				attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: voiceCaptureSupported ? "audio/ogg" : file.mimeType ?? null, temporary: true as const,
+					...(voiceCaptureSupported ? { mediaKind: "voice" as const, durationSeconds: relayVoice?.durationSeconds ?? null } : {}) })),
 				typedCaptureSupported: files.length === 0 && turn.payload?.hasMedia !== true
 					&& (turn.userText !== undefined || turn.payload?.text !== undefined),
+				voiceCaptureSupported,
 			},
 			chatId: turn.chatId,
 			replyToMessageId: turn.payload?.messageId ?? 0,

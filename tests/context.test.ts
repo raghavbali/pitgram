@@ -4,6 +4,8 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { voiceMetadata } from "../relay/lib/voice_metadata.js";
+import { collectFileIds, minimalMessage } from "../relay/lib/telegram_message.js";
 
 const testHome = await mkdtemp(join(tmpdir(), "pitgram-context-"));
 const previousHome = process.env.HOME;
@@ -114,6 +116,7 @@ test("direct turn preserves untrimmed text, isolates history and refuses local p
     assert.equal(first.source.timestamp, 1700000000);
     assert.equal(first.source.relayTurnId, null);
     assert.equal(first.source.typedCaptureSupported, true);
+    assert.equal(first.source.voiceCaptureSupported, false);
     await eventually(() => updates.length === 0);
     await app.end();
     assert.equal((await app.context()).available, false);
@@ -169,10 +172,18 @@ test("relay uses edited delivered text and a stable relay fallback when message 
   }
 });
 
-test("direct attachment and voice events never advertise typed capture", async () => {
-  for (const media of [
-    { caption: "idea: this is a test idea", document: { file_id: "document", file_name: "note.txt" } },
-    { voice: { file_id: "voice", mime_type: "audio/ogg" } },
+test("direct voice context is limited to one eligible voice note", async () => {
+  for (const [media, expectedVoice] of [
+    [{ voice: { file_id: "voice", mime_type: "audio/ogg", duration: 9 } }, true],
+    [{ voice: { file_id: "voice", duration: 9 } }, true],
+    [{ voice: { file_id: "voice", mime_type: "audio/ogg", duration: -1 } }, false],
+    [{ voice: { file_id: "voice", mime_type: "audio/ogg", duration: 1.5 } }, false],
+    [{ caption: "transcript", voice: { file_id: "voice", mime_type: "audio/ogg" } }, false],
+    [{ document: { file_id: "document", file_name: "note.txt", mime_type: "audio/ogg" } }, false],
+    [{ audio: { file_id: "audio", mime_type: "audio/ogg" } }, false],
+    [{ media_group_id: "album", voice: { file_id: "voice", mime_type: "audio/ogg" } }, false],
+    [{ voice: { file_id: "voice", mime_type: "audio/mpeg" } }, false],
+    [{ voice: { file_id: "voice", mime_type: "audio/ogg" }, document: { file_id: "extra", file_name: "x" } }, false],
   ]) {
     let dispatched = false;
     const fetchMock = async (url: string, init?: RequestInit) => {
@@ -181,7 +192,8 @@ test("direct attachment and voice events never advertise typed capture", async (
         if (!dispatched) {
           dispatched = true;
           return fakeResponse([{ update_id: 1, message: {
-            message_id: 101, chat: { id: 42, type: "private" }, from: { id: 42 }, ...media,
+            message_id: 101, date: media.voice ? 1700000000 : undefined,
+            chat: { id: 42, type: "private" }, from: { id: 42 }, ...media,
           } }]);
         }
         await new Promise<void>((resolve) => init?.signal?.addEventListener("abort", () => resolve(), { once: true }));
@@ -200,9 +212,13 @@ test("direct attachment and voice events never advertise typed capture", async (
       const envelope = await app.context();
       assert.equal(envelope.available, true);
       assert.equal(envelope.source.typedCaptureSupported, false);
-      assert.equal(envelope.source.attachments.length, 1);
+      assert.equal(envelope.source.voiceCaptureSupported, expectedVoice);
+      assert.equal(envelope.source.attachments.length, media.voice && media.document ? 2 : 1);
       assert.equal(envelope.source.attachments[0].temporary, true);
-      assert.equal(envelope.source.timestamp, null);
+      assert.equal(envelope.source.attachments[0].mediaKind, expectedVoice ? "voice" : undefined);
+      assert.equal(envelope.source.attachments[0].durationSeconds, expectedVoice ? (media.voice?.duration ?? null) : undefined);
+      if (expectedVoice) assert.equal(envelope.source.attachments[0].mimeType, "audio/ogg");
+      assert.equal(envelope.source.timestamp, media.voice ? 1700000000 : null);
       await app.end();
     } finally {
       await app.close();
@@ -239,11 +255,72 @@ test("relay preserves actual message identity and refuses flagged media without 
       assert.equal(envelope.source.relayTurnId, 77);
       assert.equal(envelope.source.timestamp, null);
       assert.equal(envelope.source.typedCaptureSupported, !hasMedia);
+      assert.equal(envelope.source.voiceCaptureSupported, false);
       await app.end();
     } finally {
       await app.close();
     }
   }
+});
+
+test("relay voice context requires explicit voice metadata and one uncaptioned Ogg attachment", async () => {
+  for (const [turn, expectedVoice] of [
+    [{ userText: "", payload: { messageId: 101, date: 1700000000, text: "", hasMedia: true, voice: { mimeType: "audio/ogg", durationSeconds: 6 } }, attachments: [{ fileId: "v", mimeType: "audio/ogg", fileName: "voice.ogg" }] }, true],
+    [{ userText: "", payload: { messageId: 101, date: 1700000000, text: "", hasMedia: true, voice: { mimeType: "audio/ogg", durationSeconds: null } }, attachments: [{ fileId: "v", mimeType: "audio/ogg", fileName: "voice.ogg" }] }, true],
+    [{ userText: "", payload: { messageId: 101, text: "", hasMedia: true }, attachments: [{ fileId: "v", mimeType: "audio/ogg", fileName: "voice.ogg" }] }, false],
+    [{ userText: "caption", payload: { messageId: 101, text: "caption", hasMedia: true, voice: { mimeType: "audio/ogg", durationSeconds: 6 } }, attachments: [{ fileId: "v", mimeType: "audio/ogg" }] }, false],
+    [{ userText: "", payload: { messageId: 101, text: " ", hasMedia: true, voice: { mimeType: "audio/ogg", durationSeconds: 6 } }, attachments: [{ fileId: "v", mimeType: "audio/ogg" }] }, false],
+    [{ userText: " ", payload: { messageId: 101, text: "", hasMedia: true, voice: { mimeType: "audio/ogg", durationSeconds: 6 } }, attachments: [{ fileId: "v", mimeType: "audio/ogg" }] }, false],
+    [{ userText: "", payload: { messageId: 101, text: "", hasMedia: true, voice: { mimeType: "audio/ogg", durationSeconds: -1 } }, attachments: [{ fileId: "v", mimeType: "audio/ogg" }] }, false],
+    [{ userText: "", payload: { messageId: 101, text: "", hasMedia: true, voice: { mimeType: "audio/ogg", durationSeconds: 1.5 } }, attachments: [{ fileId: "v", mimeType: "audio/ogg" }] }, false],
+    [{ userText: "", payload: { messageId: 101, text: "", hasMedia: true, voice: { mimeType: "audio/ogg", durationSeconds: 6 } }, attachments: [{ fileId: "v", mimeType: "audio/ogg" }, { fileId: "x", mimeType: "audio/ogg" }] }, false],
+    [{ userText: "", payload: { messageId: 101, text: "", hasMedia: true, voice: { mimeType: "audio/ogg", durationSeconds: 6 } }, attachments: [{ fileId: "v", mimeType: "audio/mpeg" }] }, false],
+  ] as const) {
+    let claimed = false;
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      if (url.includes("cloud.telegram.org")) {
+        const { args } = JSON.parse(String(init?.body));
+        const result: any = { ok: true };
+        if (args.op === "next") { result.turn = claimed ? null : { id: 77, chatId: 42, ...turn }; claimed = true; }
+        return { ok: true, json: async () => ({ ok: true, result: { result } }) } as Response;
+      }
+      if (url.includes("/file/bot")) return new Response("voice fixture");
+      if (url.endsWith("/getFile")) return fakeResponse({ file_path: "fixture" });
+      return fakeResponse({ message_id: 501 });
+    };
+    const app = await fixture({ botToken: "TEST_TOKEN", allowedUserId: 42, relayEnabled: true, relayToken: "app123:TEST" }, fetchMock as typeof fetch);
+    try {
+      await eventually(() => app.sent.length > 0);
+      await app.start(app.sent[0][0].text);
+      const source = (await app.context()).source;
+      assert.equal(source.voiceCaptureSupported, expectedVoice);
+      assert.equal(source.messageId, 101);
+      assert.equal(source.timestamp, expectedVoice ? 1700000000 : null);
+      assert.equal(source.attachments[0].mediaKind, expectedVoice ? "voice" : undefined);
+      assert.equal(source.attachments[0].durationSeconds, expectedVoice ? turn.payload.voice.durationSeconds : undefined);
+      await app.end();
+      assert.equal((await app.context()).available, false);
+    } finally { await app.close(); }
+  }
+});
+
+test("relay voice metadata producer defaults missing voice MIME and rejects other media, text, and invalid durations", () => {
+  const message = { message_id: 101, date: 1700000000, chat: { id: 42 }, voice: { file_id: "voice" } };
+  const voiceFile = collectFileIds(message);
+  assert.equal(voiceFile[0].mimeType, "audio/ogg");
+  assert.deepEqual(minimalMessage(message, "").voice, { mimeType: "audio/ogg", durationSeconds: null });
+  assert.equal(minimalMessage(message, "").date, 1700000000);
+  for (const message of [
+    { voice: { file_id: "voice" }, caption: " " },
+    { voice: { file_id: "voice" }, text: "\t" },
+    { voice: { file_id: "voice" }, document: { file_id: "doc" } },
+    { voice: { file_id: "voice", duration: -1 } },
+    { voice: { file_id: "voice", duration: 1.25 } },
+  ]) {
+    assert.equal(voiceMetadata(message, voiceFile), null);
+    assert.equal(minimalMessage({ ...message, chat: { id: 42 }, message_id: 101 }, "").voice, undefined);
+  }
+  assert.equal(voiceMetadata({ voice: { file_id: "voice" } }, [{ ...voiceFile[0], isImage: true }]), null);
 });
 
 test("a media group survives shutdown during aggregation and recovers both raw attachment identities", async () => {
