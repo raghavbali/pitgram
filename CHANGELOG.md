@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0
+
+- Add an additive `voiceCaptureSupported` fact and voice attachment metadata to active version 1 source context for a single uncaptioned Telegram voice note.
+- Preserve direct voice MIME and duration when available, and carry explicit voice metadata through relay turns without inferring voice from filenames or generic audio attachments.
+- Document that voice paths remain temporary and Pitgram does not transcribe them or guarantee durable attachment storage.
+
 ## 1.3.0
 
 - Persist direct-polling raw batches before advancing Telegram's offset, with synced atomic snapshots and owner-only permissions.
