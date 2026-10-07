@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.0
+
+- Add `pitgram_inline` for bounded inline-button views during authorized direct Telegram turns.
+- Retain opaque callback grants bound to paired sender, private chat, original bot message, workspace and expiry; expose clicks only through current structured context.
+- Persist callback updates in the existing durable direct queue and serialize them with busy Pi turns.
+- Keep relay mode on text controls; no second poller or arbitrary command execution is added.
+
 ## 1.4.0
 
 - Add an additive `voiceCaptureSupported` fact and voice attachment metadata to active version 1 source context for a single uncaptioned Telegram voice note.
