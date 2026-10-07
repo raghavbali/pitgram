@@ -3,6 +3,7 @@ import { basename, dirname, extname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { InlineButtonRegistry } from "./inline-buttons.js";
+import { readInlineView } from "./inline-view.js";
 import { ExtensionRunner, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DurableQueue } from "./durable-queue.js";
@@ -301,6 +302,10 @@ export default function (pi) {
     let preserveQueuedTurnsAsHistory = false;
     let setupInProgress = false;
     let previewState;
+    let inlineViewDeliveredThisTurn = false;
+    let ownedPreviewMessageIds = [];
+    let previewFlushPromise;
+    let inlineViewDeliveryInProgress = false;
     let draftSupport = "unknown";
     let nextDraftId = 0;
     const mediaGroups = new Map();
@@ -564,6 +569,8 @@ export default function (pi) {
         if (state.messageId === undefined) {
             const sent = await callTelegram("sendMessage", { chat_id: chatId, text: truncated });
             state.messageId = sent.message_id;
+            if (!ownedPreviewMessageIds.includes(sent.message_id))
+                ownedPreviewMessageIds.push(sent.message_id);
             state.mode = "message";
             state.lastSentText = truncated;
             return;
@@ -573,10 +580,15 @@ export default function (pi) {
         state.lastSentText = truncated;
     }
     function schedulePreviewFlush(chatId) {
-        if (!previewState || previewState.flushTimer)
+        if (!previewState || previewState.flushTimer || inlineViewDeliveryInProgress || inlineViewDeliveredThisTurn)
             return;
         previewState.flushTimer = setTimeout(() => {
-            void flushPreview(chatId).catch(() => undefined);
+            const flushing = flushPreview(chatId).catch(() => undefined);
+            previewFlushPromise = flushing;
+            void flushing.finally(() => {
+                if (previewFlushPromise === flushing)
+                    previewFlushPromise = undefined;
+            });
         }, PREVIEW_THROTTLE_MS);
     }
     async function finalizePreview(chatId) {
@@ -590,7 +602,9 @@ export default function (pi) {
             return false;
         }
         if (state.mode === "draft") {
-            await callTelegram("sendMessage", { chat_id: chatId, text: finalText });
+            const sent = await callTelegram("sendMessage", { chat_id: chatId, text: finalText });
+            if (!ownedPreviewMessageIds.includes(sent.message_id))
+                ownedPreviewMessageIds.push(sent.message_id);
             await clearPreview(chatId);
             return true;
         }
@@ -863,6 +877,7 @@ export default function (pi) {
                 typedCaptureSupported: messages.length === 1 && firstMessage.text !== undefined && files.length === 0,
                 voiceCaptureSupported,
                 inlineButtonsSupported: true,
+                compactInlineSupported: true,
             },
             chatId: firstMessage.chat.id,
             replyToMessageId: firstMessage.message_id,
@@ -928,6 +943,7 @@ export default function (pi) {
                     && (turn.userText !== undefined || turn.payload?.text !== undefined),
                 voiceCaptureSupported,
                 inlineButtonsSupported: false,
+                compactInlineSupported: false,
             },
             chatId: turn.chatId,
             replyToMessageId: turn.payload?.messageId ?? 0,
@@ -1459,6 +1475,7 @@ export default function (pi) {
                 typedCaptureSupported: false,
                 voiceCaptureSupported: false,
                 inlineButtonsSupported: true,
+                compactInlineSupported: true,
                 callback: {
                     data: grant.data,
                     grantId: grant.id,
@@ -1695,67 +1712,128 @@ export default function (pi) {
     pi.registerTool({
         name: "pitgram_inline",
         label: "Pitgram Inline Buttons",
-        description: "Send a standalone Telegram message with bounded inline buttons during an authorized direct-polling turn.",
+        description: "Send or update a Telegram inline-button view during an authorized direct-polling turn.",
         promptSnippet: "Send native Telegram inline button views with pitgram_inline.",
         promptGuidelines: [
             "Use pitgram_inline only for a current authorized direct Telegram turn when the user should choose among concrete actions.",
             "Keep each button's data as the opaque action reference supplied by the workspace; do not transform or execute it.",
+            "When the workspace returns viewPath and viewSha256 for a compact Telegram view, pass both unchanged to pitgram_inline; do not open or reinterpret the artifact.",
         ],
         parameters: Type.Object({
-            text: Type.String({ minLength: 1, maxLength: MAX_MESSAGE_LENGTH, description: "Visible text for the standalone Telegram message." }),
-            buttons: Type.Array(Type.Array(Type.Object({
+            text: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_MESSAGE_LENGTH, description: "Visible text for the Telegram button view." })),
+            buttons: Type.Optional(Type.Array(Type.Array(Type.Object({
                 text: Type.String({ minLength: 1, maxLength: 64, description: "Visible button label." }),
                 data: Type.String({ minLength: 1, maxLength: 2048, description: "Opaque workspace action reference." }),
-            }, { additionalProperties: false }), { minItems: 1 }), { minItems: 1, maxItems: INLINE_BUTTON_MAX_ROWS }),
+            }, { additionalProperties: false }), { minItems: 1 }), { minItems: 1, maxItems: INLINE_BUTTON_MAX_ROWS })),
+            viewPath: Type.Optional(Type.String({ minLength: 1, maxLength: 8192, description: "Private workspace button-view artifact path returned by the inbox command." })),
+            viewSha256: Type.Optional(Type.String({ minLength: 64, maxLength: 64, pattern: "^[a-f0-9]{64}$", description: "SHA-256 digest returned with the private view artifact." })),
         }, { additionalProperties: false }),
         async execute(_toolCallId, params) {
-            const turn = activeTelegramTurn;
-            const source = turn?.source;
-            if (!turn || !source || source.delivery !== "direct" || source.inlineButtonsSupported !== true
-                || source.userId === null || source.userId === undefined || !inlineButtonRegistry) {
-                throw new Error("pitgram_inline is available only during an authorized direct Telegram turn");
-            }
-            if (typeof params.text !== "string" || params.text.length < 1 || params.text.length > MAX_MESSAGE_LENGTH) {
-                throw new Error("Inline-button message text must contain 1 to 4096 characters");
-            }
-            if (!Array.isArray(params.buttons) || params.buttons.length < 1 || params.buttons.length > INLINE_BUTTON_MAX_ROWS) {
-                throw new Error(`Provide 1 to ${INLINE_BUTTON_MAX_ROWS} inline-button rows`);
-            }
-            const flatButtons = params.buttons.flat();
-            if (flatButtons.length < 1 || flatButtons.length > INLINE_BUTTON_MAX_COUNT) {
-                throw new Error(`Provide at most ${INLINE_BUTTON_MAX_COUNT} inline buttons`);
-            }
-            for (const row of params.buttons) {
-                if (!Array.isArray(row) || row.length < 1)
-                    throw new Error("Inline-button rows cannot be empty");
-            }
-            for (const button of flatButtons) {
-                if (!button || typeof button.text !== "string" || [...button.text].length < 1 || [...button.text].length > 64) {
-                    throw new Error("Button labels must contain 1 to 64 characters");
+            const input = params;
+            let lockedInlineDelivery = false;
+            try {
+                const turn = activeTelegramTurn;
+                const source = turn?.source;
+                if (!turn || !source || source.delivery !== "direct" || source.inlineButtonsSupported !== true
+                    || source.userId === null || source.userId === undefined || !inlineButtonRegistry) {
+                    throw new Error("pitgram_inline is available only during an authorized direct Telegram turn");
                 }
-                if (typeof button.data !== "string" || Buffer.byteLength(button.data, "utf8") < 1 || Buffer.byteLength(button.data, "utf8") > 2048) {
-                    throw new Error("Button data must contain 1 to 2048 UTF-8 bytes");
+                let view;
+                const compact = typeof input.viewPath === "string" || typeof input.viewSha256 === "string";
+                if (compact) {
+                    if (typeof input.viewPath !== "string" || typeof input.viewSha256 !== "string"
+                        || Object.hasOwn(input, "text") || Object.hasOwn(input, "buttons"))
+                        throw new Error("Provide only a complete inline view reference");
+                    if (source.compactInlineSupported !== true)
+                        throw new Error("Compact inline views are not supported for this Telegram source");
+                    view = await readInlineView(input.viewPath, input.viewSha256, {
+                        chatId: source.chatId, userId: source.userId, originCwd: source.originCwd,
+                    });
                 }
+                else {
+                    if (typeof input.viewPath === "string" || typeof input.viewSha256 === "string")
+                        throw new Error("Provide both compact view fields together");
+                    if (typeof input.text !== "string" || input.text.length < 1 || input.text.length > MAX_MESSAGE_LENGTH) {
+                        throw new Error("Inline-button message text must contain 1 to 4096 characters");
+                    }
+                    if (!Array.isArray(input.buttons) || input.buttons.length < 1 || input.buttons.length > INLINE_BUTTON_MAX_ROWS) {
+                        throw new Error(`Provide 1 to ${INLINE_BUTTON_MAX_ROWS} inline-button rows`);
+                    }
+                    view = { text: input.text, buttons: input.buttons, suppressFinalReply: false };
+                }
+                const flatButtons = view.buttons.flat();
+                if (flatButtons.length < 1 || flatButtons.length > INLINE_BUTTON_MAX_COUNT)
+                    throw new Error(`Provide at most ${INLINE_BUTTON_MAX_COUNT} inline buttons`);
+                for (const row of view.buttons)
+                    if (!Array.isArray(row) || row.length < 1)
+                        throw new Error("Inline-button rows cannot be empty");
+                for (const button of flatButtons) {
+                    if (!button || typeof button.text !== "string" || [...button.text].length < 1 || [...button.text].length > 64)
+                        throw new Error("Button labels must contain 1 to 64 characters");
+                    if (typeof button.data !== "string" || Buffer.byteLength(button.data, "utf8") < 1 || Buffer.byteLength(button.data, "utf8") > 2048)
+                        throw new Error("Button data must contain 1 to 2048 UTF-8 bytes");
+                }
+                if (compact) {
+                    if (previewState?.flushTimer) {
+                        clearTimeout(previewState.flushTimer);
+                        previewState.flushTimer = undefined;
+                    }
+                    await previewFlushPromise?.catch(() => undefined);
+                    if (previewState?.flushTimer) {
+                        clearTimeout(previewState.flushTimer);
+                        previewState.flushTimer = undefined;
+                    }
+                    inlineViewDeliveryInProgress = true;
+                    lockedInlineDelivery = true;
+                }
+                let sentMessageId;
+                const callbackMessageId = compact && source.callback ? source.messageId : null;
+                const existingPreview = compact && !source.callback
+                    ? (previewState?.mode === "message" ? previewState.messageId : ownedPreviewMessageIds.at(-1))
+                    : undefined;
+                if (callbackMessageId !== null && callbackMessageId !== undefined)
+                    sentMessageId = callbackMessageId;
+                else if (existingPreview !== undefined)
+                    sentMessageId = existingPreview;
+                else {
+                    const sent = await callTelegram("sendMessage", { chat_id: source.chatId, text: view.text });
+                    sentMessageId = sent.message_id;
+                }
+                const grants = await inlineButtonRegistry.createBatch(flatButtons.map(button => ({ data: button.data, label: button.text })), source.userId, source.chatId, sentMessageId, source.originCwd);
+                let grantIndex = 0;
+                const keyboard = view.buttons.map(row => row.map(button => ({
+                    text: button.text,
+                    callback_data: `pg:${grants[grantIndex++].id}`,
+                })));
+                if (callbackMessageId !== null && callbackMessageId !== undefined || existingPreview !== undefined) {
+                    await callTelegram("editMessageText", {
+                        chat_id: source.chatId, message_id: sentMessageId, text: view.text,
+                        reply_markup: { inline_keyboard: keyboard },
+                    });
+                }
+                else {
+                    await callTelegram("editMessageReplyMarkup", {
+                        chat_id: source.chatId, message_id: sentMessageId, reply_markup: { inline_keyboard: keyboard },
+                    });
+                }
+                if (compact) {
+                    for (const messageId of ownedPreviewMessageIds) {
+                        if (messageId !== sentMessageId)
+                            await callTelegram("deleteMessage", { chat_id: source.chatId, message_id: messageId }).catch(() => undefined);
+                    }
+                    ownedPreviewMessageIds = [];
+                    await clearPreview(source.chatId);
+                    inlineViewDeliveredThisTurn = view.suppressFinalReply;
+                }
+                return {
+                    content: [{ type: "text", text: `Sent inline-button view with ${flatButtons.length} button(s).` }],
+                    details: { messageId: sentMessageId, buttons: flatButtons.map(button => button.text), compact },
+                };
             }
-            const sent = await callTelegram("sendMessage", {
-                chat_id: source.chatId,
-                text: params.text,
-            });
-            const grants = await inlineButtonRegistry.createBatch(flatButtons.map(button => ({ data: button.data, label: button.text })), source.userId, source.chatId, sent.message_id, source.originCwd);
-            let grantIndex = 0;
-            const keyboard = params.buttons.map(row => row.map(button => ({
-                text: button.text,
-                callback_data: `pg:${grants[grantIndex++].id}`,
-            })));
-            await callTelegram("editMessageReplyMarkup", {
-                chat_id: source.chatId,
-                message_id: sent.message_id,
-                reply_markup: { inline_keyboard: keyboard },
-            });
-            return {
-                content: [{ type: "text", text: `Sent inline-button view with ${flatButtons.length} button(s).` }],
-                details: { messageId: sent.message_id, buttons: flatButtons.map(button => button.text) },
-            };
+            finally {
+                if (lockedInlineDelivery)
+                    inlineViewDeliveryInProgress = false;
+            }
         },
     });
     pi.registerTool({
@@ -1998,6 +2076,8 @@ export default function (pi) {
                 dispatchedTelegramTurn = undefined;
                 activeTelegramTurn = { ...nextTurn };
                 lastTelegramResult = undefined;
+                inlineViewDeliveredThisTurn = false;
+                ownedPreviewMessageIds = [];
                 previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
                 startTypingLoop(ctx);
             }
@@ -2008,6 +2088,14 @@ export default function (pi) {
     pi.on("message_start", async (event, _ctx) => {
         if (!activeTelegramTurn || !isAssistantMessage(event.message))
             return;
+        if (inlineViewDeliveredThisTurn) {
+            await clearPreview(activeTelegramTurn.chatId);
+            return;
+        }
+        if (activeTelegramTurn.source.callback) {
+            await clearPreview(activeTelegramTurn.chatId);
+            return;
+        }
         if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
             await finalizePreview(activeTelegramTurn.chatId);
         }
@@ -2015,6 +2103,8 @@ export default function (pi) {
     });
     pi.on("message_update", async (event, _ctx) => {
         if (!activeTelegramTurn || !isAssistantMessage(event.message))
+            return;
+        if (activeTelegramTurn.source.callback || inlineViewDeliveredThisTurn)
             return;
         if (!previewState) {
             previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
@@ -2050,6 +2140,14 @@ export default function (pi) {
                 return;
             }
             const finalText = assistant.text;
+            if (inlineViewDeliveredThisTurn) {
+                await clearPreview(turn.chatId);
+                await sendQueuedAttachments(turn);
+                if (turn.relayTurnId !== undefined)
+                    await callRelay({ op: "done", chatId: turn.chatId, turnId: turn.relayTurnId }).catch(() => undefined);
+                completed = true;
+                return;
+            }
             if (previewState) {
                 previewState.pendingText = finalText ?? previewState.pendingText;
             }
