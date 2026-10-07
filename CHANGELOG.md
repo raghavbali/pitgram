@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.0
+
+- Add direct-mode notification status/send channels on Pi's shared extension event bus, scoped to the connected bot, paired private chat, and canonical active workspace.
+- Expose notification capability in direct `pitgram_context` and register `pitgram_notify` for explicitly requested one-off plain-text messages without starting an agent turn.
+- Bound sends to 15 seconds and return fixed sent, not-sent, or uncertain results; disconnect and shutdown abort in-flight requests before releasing the durable queue owner.
+
 ## 1.5.1
 
 - Add digest-bound private inline view references to avoid copying full keyboards through the model; retain the existing text/buttons tool input.
