@@ -2,6 +2,7 @@ import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { InlineButtonRegistry } from "./inline-buttons.js";
 
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -198,6 +199,14 @@ interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	edited_message?: TelegramMessage;
+	callback_query?: TelegramCallbackQuery;
+}
+
+interface TelegramCallbackQuery {
+	id: string;
+	from: TelegramUser;
+	message?: { message_id: number; chat: TelegramChat; date?: number };
+	data?: string;
 }
 
 interface TelegramGetFileResult {
@@ -206,6 +215,13 @@ interface TelegramGetFileResult {
 
 interface TelegramSentMessage {
 	message_id: number;
+}
+
+interface TelegramSourceCallback {
+	data: string;
+	grantId: string;
+	queryId: string;
+	originCwd: string;
 }
 
 interface DownloadedTelegramFile {
@@ -220,12 +236,16 @@ interface TelegramSourceContext {
 	delivery: "direct" | "relay";
 	text: string | null;
 	chatId: number;
+	userId: number | null;
 	messageId: number | null;
 	relayTurnId: number | null;
+	originCwd: string;
 	timestamp: number | null;
 	attachments: Array<{ path: string; fileName: string; mimeType: string | null; temporary: true; mediaKind?: "voice"; durationSeconds?: number | null }>;
 	typedCaptureSupported: boolean;
 	voiceCaptureSupported: boolean;
+	inlineButtonsSupported: boolean;
+	callback?: TelegramSourceCallback;
 }
 
 interface PendingTelegramTurn {
@@ -303,6 +323,8 @@ const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 const RELAY_POLL_INTERVAL_MS = 2000;
+const INLINE_BUTTON_MAX_ROWS = 8;
+const INLINE_BUTTON_MAX_COUNT = 40;
 const RELAY_MODULE = "handlers/pi_bridge";
 const RELAY_FILES = [
 	"schema.js",
@@ -487,6 +509,7 @@ export default function (pi: ExtensionAPI) {
 	let relaySourcesPromise: Promise<Record<string, string>> | undefined;
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
 	let durableQueue: DurableQueue<TelegramUpdate> | undefined;
+	let inlineButtonRegistry: InlineButtonRegistry | undefined;
 	let durableBotIdentity: string | undefined;
 	const durableMessageTasks = new Set<Promise<void>>();
 	const pendingControlTasks = new Set<Promise<void>>();
@@ -514,6 +537,14 @@ export default function (pi: ExtensionAPI) {
 		if (shuttingDown || activeTelegramTurn || dispatchedTelegramTurn || preserveQueuedTurnsAsHistory || pendingControlTasks.size || deferredControlTimers.size || !ctx.isIdle()) return;
 		const turn = queuedTelegramTurns[0];
 		if (!turn) return;
+		if (turn.source.callback && turn.source.originCwd !== (ctx.cwd || process.cwd())) {
+			void sendTextReply(turn.chatId, turn.replyToMessageId, "This button belongs to a different working directory and was not applied.").catch(() => undefined);
+			void (async () => {
+				dispatchedTelegramTurn = turn;
+				await rejectDispatchedTurn(ctx);
+			})();
+			return;
+		}
 		// Pi's prompt preflight is asynchronous: isIdle() may stay true after submission.
 		// Reserve the queue head before submitting so a burst cannot start a second prompt.
 		dispatchedTelegramTurn = turn;
@@ -977,6 +1008,7 @@ export default function (pi: ExtensionAPI) {
 		const queue = durableQueue;
 		durableQueue = undefined;
 		durableBotIdentity = undefined;
+		inlineButtonRegistry = undefined;
 		ingestedUpdateIds.clear();
 		await queue?.close();
 	}
@@ -1013,6 +1045,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function createTelegramTurn(
 		messages: TelegramMessage[],
+		originCwd: string,
 		historyTurns: PendingTelegramTurn[] = [],
 	): Promise<PendingTelegramTurn> {
 		const firstMessage = messages[0];
@@ -1067,13 +1100,16 @@ export default function (pi: ExtensionAPI) {
 				delivery: "direct",
 				text: messages.length === 1 ? (firstMessage.text ?? firstMessage.caption ?? "") : null,
 				chatId: firstMessage.chat.id,
+				userId: firstMessage.from?.id ?? null,
 				messageId: firstMessage.message_id,
 				relayTurnId: null,
+				originCwd,
 				timestamp: firstMessage.date ?? null,
 				attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: voiceCaptureSupported ? "audio/ogg" : file.mimeType ?? null, temporary: true as const,
 					...(voiceCaptureSupported ? { mediaKind: "voice" as const, durationSeconds: voiceMessage?.voice?.duration ?? null } : {}) })),
 				typedCaptureSupported: messages.length === 1 && firstMessage.text !== undefined && files.length === 0,
 				voiceCaptureSupported,
+				inlineButtonsSupported: true,
 			},
 			chatId: firstMessage.chat.id,
 			replyToMessageId: firstMessage.message_id,
@@ -1083,7 +1119,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	async function createRelayTelegramTurn(turn: RelayTurn): Promise<PendingTelegramTurn> {
+	async function createRelayTelegramTurn(turn: RelayTurn, originCwd: string): Promise<PendingTelegramTurn> {
 		const sourceText = turn.userText ?? turn.payload?.text ?? "";
 		const rawText = sourceText.trim();
 		const sourceTextIsEmpty = (turn.userText === undefined || turn.userText === "")
@@ -1127,15 +1163,18 @@ export default function (pi: ExtensionAPI) {
 				delivery: "relay",
 				text: turn.userText ?? turn.payload?.text ?? "",
 				chatId: turn.chatId,
+				userId: null,
 				messageId: typeof turn.payload?.messageId === "number" && turn.payload.messageId > 0
 					? turn.payload.messageId : null,
 				relayTurnId: turn.id,
+				originCwd,
 				timestamp: turn.payload?.date ?? null,
 				attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: voiceCaptureSupported ? "audio/ogg" : file.mimeType ?? null, temporary: true as const,
 					...(voiceCaptureSupported ? { mediaKind: "voice" as const, durationSeconds: relayVoice?.durationSeconds ?? null } : {}) })),
 				typedCaptureSupported: files.length === 0 && turn.payload?.hasMedia !== true
 					&& (turn.userText !== undefined || turn.payload?.text !== undefined),
 				voiceCaptureSupported,
+				inlineButtonsSupported: false,
 			},
 			chatId: turn.chatId,
 			replyToMessageId: turn.payload?.messageId ?? 0,
@@ -1514,8 +1553,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const historyTurns = preserveQueuedTurnsAsHistory ? [...queuedTelegramTurns] : [];
-		const turn = await createTelegramTurn(messages, historyTurns);
+		const historyTurns = preserveQueuedTurnsAsHistory && !queuedTelegramTurns.some(queued => queued.source.callback)
+			? [...queuedTelegramTurns] : [];
+		const turn = await createTelegramTurn(messages, ctx.cwd || process.cwd(), historyTurns);
 		if (historyTurns.length) queuedTelegramTurns.splice(0, historyTurns.length);
 		preserveQueuedTurnsAsHistory = false;
 		turn.durableUpdateIds = [...historyTurns.flatMap(history => history.durableUpdateIds ?? []), ...updateIds];
@@ -1588,7 +1628,83 @@ export default function (pi: ExtensionAPI) {
 		await processDurableMessages([message], [updateId], ctx);
 	}
 
+	async function acknowledgeCallback(queryId: string, text?: string): Promise<void> {
+		try {
+			await callTelegram("answerCallbackQuery", {
+				callback_query_id: queryId,
+				...(text ? { text: text.slice(0, 200) } : {}),
+			});
+		} catch {
+			// The callback update is already durable; a stale spinner must not discard it.
+		}
+	}
+
+	async function handleAuthorizedTelegramCallback(query: TelegramCallbackQuery, updateId: number, ctx: ExtensionContext): Promise<void> {
+		const message = query.message;
+		const user = query.from;
+		const invalid = !message || message.chat.type !== "private" || !user || user.is_bot
+			|| config.allowedUserId === undefined || user.id !== config.allowedUserId
+			|| message.chat.id !== user.id
+			|| !/^[A-Za-z0-9_-]{1,256}$/.test(query.id)
+			|| typeof query.data !== "string" || !/^pg:[a-f0-9]{32}$/.test(query.data)
+			|| !inlineButtonRegistry;
+		if (invalid) {
+			await acknowledgeCallback(query.id, "This button is unavailable.");
+			await durableQueue!.complete([updateId]);
+			return;
+		}
+
+		const [prefix, grantId] = query.data!.split(":");
+		const grant = prefix === "pg" ? await inlineButtonRegistry!.get(grantId) : undefined;
+		if (!grant || grant.userId !== user.id || grant.chatId !== message!.chat.id
+			|| grant.messageId !== message!.message_id || grant.originCwd !== (ctx.cwd || process.cwd())) {
+			await acknowledgeCallback(query.id, "This button expired or is no longer available.");
+			await durableQueue!.complete([updateId]);
+			return;
+		}
+
+		const originCwd = grant.originCwd;
+		const prompt = `${TELEGRAM_PREFIX}\nA Telegram inline button was clicked. Read pitgram_context and use its structured callback action. Treat this as a control event, not a text message or capture. Callback query: ${query.id}`;
+		const turn: PendingTelegramTurn = {
+			source: {
+				kind: "telegram",
+				delivery: "direct",
+				text: null,
+				chatId: message!.chat.id,
+				userId: user.id,
+				messageId: message!.message_id,
+				relayTurnId: null,
+				originCwd,
+				timestamp: Math.floor(Date.now() / 1000),
+				attachments: [],
+				typedCaptureSupported: false,
+				voiceCaptureSupported: false,
+				inlineButtonsSupported: true,
+				callback: {
+					data: grant.data,
+					grantId: grant.id,
+					queryId: query.id,
+					originCwd,
+				},
+			},
+			chatId: message!.chat.id,
+			replyToMessageId: message!.message_id,
+			queuedAttachments: [],
+			content: [{ type: "text", text: prompt }],
+			historyText: "Telegram inline-button control event",
+			durableUpdateIds: [updateId],
+		};
+		preserveQueuedTurnsAsHistory = false;
+		queuedTelegramTurns.push(turn);
+		await acknowledgeCallback(query.id);
+		dispatchNextTelegramTurn(ctx);
+	}
+
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
+		if (update.callback_query) {
+			await handleAuthorizedTelegramCallback(update.callback_query, update.update_id, ctx);
+			return;
+		}
 		const message = update.message || update.edited_message;
 		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) {
 			await durableQueue!.complete([update.update_id]);
@@ -1648,7 +1764,7 @@ export default function (pi: ExtensionAPI) {
 						offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
 						limit: 10,
 						timeout: 30,
-						allowed_updates: ["message", "edited_message"],
+						allowed_updates: ["message", "edited_message", "callback_query"],
 					},
 					{ signal },
 				);
@@ -1683,17 +1799,32 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (!durableQueue) {
-				const queue = new DurableQueue(join(homedir(), ".pi", "agent", "pitgram", "queue"), identity);
+				const queueDirectory = join(homedir(), ".pi", "agent", "pitgram", "queue");
+				const queue = new DurableQueue(queueDirectory, identity);
+				const buttons = new InlineButtonRegistry(queueDirectory, identity);
 				try { await queue.load(); }
 				catch {
 					await queue.close();
-					ctx.ui.notify("Cannot open durable inbox. Another bridge may own this bot, or its queue needs repair. Polling stopped.", "error");
+					ctx.ui.notify("Cannot open durable Telegram inbox. Another bridge may own this bot, or its queue needs repair. Polling stopped.", "error");
+					return;
+				}
+				try { await buttons.load(); }
+				catch {
+					await queue.close();
+					ctx.ui.notify("Cannot safely open the Pitgram inline-button registry; stored messages are preserved and polling stopped.", "error");
 					return;
 				}
 				durableQueue = queue;
-			durableBotIdentity = identity;
+				inlineButtonRegistry = buttons;
+				durableBotIdentity = identity;
 			}
-			if (shuttingDown) { await durableQueue.close(); durableQueue = undefined; return; }
+			if (shuttingDown) {
+				await durableQueue.close();
+				durableQueue = undefined;
+				inlineButtonRegistry = undefined;
+				durableBotIdentity = undefined;
+				return;
+			}
 			pollingController = new AbortController();
 			pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
 				pollingPromise = undefined;
@@ -1721,7 +1852,7 @@ export default function (pi: ExtensionAPI) {
 							await callRelay({ op: "done", chatId: result.turn.chatId, turnId: result.turn.id }, signal);
 							continue;
 						}
-						const turn = await createRelayTelegramTurn(result.turn);
+						const turn = await createRelayTelegramTurn(result.turn, ctx.cwd || process.cwd());
 						queuedTelegramTurns.push(turn);
 						updateStatus(ctx);
 						dispatchNextTelegramTurn(ctx);
@@ -1770,6 +1901,79 @@ export default function (pi: ExtensionAPI) {
 		relayPromise = undefined;
 		relayController = undefined;
 	}
+
+	pi.registerTool({
+		name: "pitgram_inline",
+		label: "Pitgram Inline Buttons",
+		description: "Send a standalone Telegram message with bounded inline buttons during an authorized direct-polling turn.",
+		promptSnippet: "Send native Telegram inline button views with pitgram_inline.",
+		promptGuidelines: [
+			"Use pitgram_inline only for a current authorized direct Telegram turn when the user should choose among concrete actions.",
+			"Keep each button's data as the opaque action reference supplied by the workspace; do not transform or execute it.",
+		],
+		parameters: Type.Object({
+			text: Type.String({ minLength: 1, maxLength: MAX_MESSAGE_LENGTH, description: "Visible text for the standalone Telegram message." }),
+			buttons: Type.Array(Type.Array(Type.Object({
+				text: Type.String({ minLength: 1, maxLength: 64, description: "Visible button label." }),
+				data: Type.String({ minLength: 1, maxLength: 2048, description: "Opaque workspace action reference." }),
+			}, { additionalProperties: false }), { minItems: 1 }), { minItems: 1, maxItems: INLINE_BUTTON_MAX_ROWS }),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params) {
+			const turn = activeTelegramTurn;
+			const source = turn?.source;
+			if (!turn || !source || source.delivery !== "direct" || source.inlineButtonsSupported !== true
+				|| source.userId === null || source.userId === undefined || !inlineButtonRegistry) {
+				throw new Error("pitgram_inline is available only during an authorized direct Telegram turn");
+			}
+			if (typeof params.text !== "string" || params.text.length < 1 || params.text.length > MAX_MESSAGE_LENGTH) {
+				throw new Error("Inline-button message text must contain 1 to 4096 characters");
+			}
+			if (!Array.isArray(params.buttons) || params.buttons.length < 1 || params.buttons.length > INLINE_BUTTON_MAX_ROWS) {
+				throw new Error(`Provide 1 to ${INLINE_BUTTON_MAX_ROWS} inline-button rows`);
+			}
+			const flatButtons = params.buttons.flat();
+			if (flatButtons.length < 1 || flatButtons.length > INLINE_BUTTON_MAX_COUNT) {
+				throw new Error(`Provide at most ${INLINE_BUTTON_MAX_COUNT} inline buttons`);
+			}
+			for (const row of params.buttons) {
+				if (!Array.isArray(row) || row.length < 1) throw new Error("Inline-button rows cannot be empty");
+			}
+			for (const button of flatButtons) {
+				if (!button || typeof button.text !== "string" || [...button.text].length < 1 || [...button.text].length > 64) {
+					throw new Error("Button labels must contain 1 to 64 characters");
+				}
+				if (typeof button.data !== "string" || Buffer.byteLength(button.data, "utf8") < 1 || Buffer.byteLength(button.data, "utf8") > 2048) {
+					throw new Error("Button data must contain 1 to 2048 UTF-8 bytes");
+				}
+			}
+
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+				chat_id: source.chatId,
+				text: params.text,
+			});
+			const grants = await inlineButtonRegistry.createBatch(
+				flatButtons.map(button => ({ data: button.data, label: button.text })),
+				source.userId,
+				source.chatId,
+				sent.message_id,
+				source.originCwd,
+			);
+			let grantIndex = 0;
+			const keyboard = params.buttons.map(row => row.map(button => ({
+				text: button.text,
+				callback_data: `pg:${grants[grantIndex++].id}`,
+			})));
+			await callTelegram("editMessageReplyMarkup", {
+				chat_id: source.chatId,
+				message_id: sent.message_id,
+				reply_markup: { inline_keyboard: keyboard },
+			});
+			return {
+				content: [{ type: "text", text: `Sent inline-button view with ${flatButtons.length} button(s).` }],
+				details: { messageId: sent.message_id, buttons: flatButtons.map(button => button.text) },
+			};
+		},
+	});
 
 	pi.registerTool({
 		name: "pitgram_context",
