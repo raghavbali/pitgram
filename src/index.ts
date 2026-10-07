@@ -1,5 +1,5 @@
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, join } from "node:path";
+import { chmod, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { InlineButtonRegistry } from "./inline-buttons.js";
@@ -11,6 +11,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import { ExtensionRunner, SessionManager, type SessionInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DurableQueue } from "./durable-queue.js";
+import { NotificationTransport, type NotificationTarget, type NotificationTargetResult, type NotificationUnavailableReason } from "./notifications.js";
 
 let activeRunner: any | undefined;
 
@@ -107,6 +108,22 @@ interface TelegramConfig {
 	relayEnabled?: boolean;
 	relayToken?: string;
 }
+
+interface NotificationConnectionSnapshot {
+	target: NotificationTarget;
+	botToken: string;
+	botId: number;
+	allowedUserId: number;
+	durableQueue: DurableQueue<TelegramUpdate>;
+	durableBotIdentity: string;
+	pollingController: AbortController;
+	pollingPromise: Promise<void>;
+	latestContext: ExtensionContext | undefined;
+}
+
+type NotificationConnectionResult =
+	| { status: "ready"; snapshot: NotificationConnectionSnapshot }
+	| { status: "unavailable"; reason: NotificationUnavailableReason };
 
 interface TelegramApiResponse<T> {
 	ok: boolean;
@@ -247,6 +264,8 @@ interface TelegramSourceContext {
 	voiceCaptureSupported: boolean;
 	inlineButtonsSupported: boolean;
 	compactInlineSupported: boolean;
+	notificationsSupported: boolean;
+	notificationTarget?: NotificationTarget;
 	callback?: TelegramSourceCallback;
 }
 
@@ -521,6 +540,7 @@ export default function (pi: ExtensionAPI) {
 	let dispatchedTelegramTurn: PendingTelegramTurn | undefined;
 	let dispatchTimer: ReturnType<typeof setTimeout> | undefined;
 	let activeTelegramTurn: ActiveTelegramTurn | undefined;
+	let latestContext: ExtensionContext | undefined;
 	let matchedTelegramTurn: PendingTelegramTurn | undefined;
 	let lastTelegramResult: ReturnType<typeof extractAssistantText> | undefined;
 	let removeRuntimeErrorListener: (() => void) | undefined;
@@ -538,6 +558,146 @@ export default function (pi: ExtensionAPI) {
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 	let sessionCache: SessionInfo[] = [];
 	let modelCache: any[] = [];
+	const notificationTransport = new NotificationTransport(pi.events ?? { on: () => () => {} }, {
+		resolveTarget: (originCwd, context) => resolveNotificationTarget(originCwd, context as ExtensionContext | undefined),
+		send: (target, text, signal, context, markRequestStarted) => sendNotificationMessage(
+			target, text, signal, context as ExtensionContext | undefined, markRequestStarted,
+		),
+	});
+
+	function notificationConnectionCurrent(snapshot: NotificationConnectionSnapshot): boolean {
+		const currentBotId = config.botToken
+			? (config.botId ?? Number(config.botToken.split(":", 1)[0]))
+			: undefined;
+		return !shuttingDown && !config.relayEnabled && !relayPromise
+			&& config.botToken === snapshot.botToken
+			&& currentBotId === snapshot.botId
+			&& config.allowedUserId === snapshot.allowedUserId
+			&& durableQueue === snapshot.durableQueue
+			&& durableBotIdentity === snapshot.durableBotIdentity
+			&& pollingController === snapshot.pollingController
+			&& pollingPromise === snapshot.pollingPromise
+			&& !snapshot.pollingController.signal.aborted
+			&& latestContext === snapshot.latestContext;
+	}
+
+	async function resolveNotificationConnection(
+		originCwd: string,
+		contextOverride?: ExtensionContext,
+	): Promise<NotificationConnectionResult> {
+		if (shuttingDown) return { status: "unavailable", reason: "shutting_down" };
+		if (config.relayEnabled || relayPromise) return { status: "unavailable", reason: "relay_mode" };
+		if (!pollingPromise || !pollingController || pollingController.signal.aborted || !durableQueue) {
+			return { status: "unavailable", reason: "not_connected" };
+		}
+		const botToken = config.botToken;
+		const pairedUserId = config.allowedUserId;
+		if (!botToken || !Number.isSafeInteger(pairedUserId) || (pairedUserId ?? 0) <= 0) {
+			return { status: "unavailable", reason: "not_paired" };
+		}
+		const parsedBotId = config.botId ?? Number(botToken.split(":", 1)[0]);
+		const botIdentity = String(parsedBotId);
+		if (!Number.isSafeInteger(parsedBotId) || parsedBotId <= 0 || durableBotIdentity !== botIdentity) {
+			return { status: "unavailable", reason: "identity_mismatch" };
+		}
+		const context = contextOverride ?? latestContext;
+		if (!context || typeof originCwd !== "string" || !isAbsolute(originCwd)) {
+			return { status: "unavailable", reason: "wrong_workspace" };
+		}
+		const snapshot: NotificationConnectionSnapshot = {
+			target: { botId: botIdentity, chatId: pairedUserId!, userId: pairedUserId!, originCwd },
+			botToken,
+			botId: parsedBotId,
+			allowedUserId: pairedUserId!,
+			durableQueue,
+			durableBotIdentity: botIdentity,
+			pollingController,
+			pollingPromise,
+			latestContext,
+		};
+		try {
+			const [canonicalOrigin, canonicalContext] = await Promise.all([
+				realpath(originCwd), realpath(context.cwd || process.cwd()),
+			]);
+			if (canonicalOrigin !== originCwd || canonicalContext !== originCwd) {
+				return { status: "unavailable", reason: "wrong_workspace" };
+			}
+		} catch {
+			return { status: "unavailable", reason: "wrong_workspace" };
+		}
+		if (!notificationConnectionCurrent(snapshot)) {
+			if (shuttingDown) return { status: "unavailable", reason: "shutting_down" };
+			if (config.relayEnabled || relayPromise) return { status: "unavailable", reason: "relay_mode" };
+			if (config.botToken !== botToken || config.allowedUserId !== pairedUserId
+				|| (config.botId ?? Number(config.botToken?.split(":", 1)[0])) !== parsedBotId
+				|| durableBotIdentity !== botIdentity) {
+				return { status: "unavailable", reason: "identity_mismatch" };
+			}
+			return { status: "unavailable", reason: "not_connected" };
+		}
+		return { status: "ready", snapshot };
+	}
+
+	async function resolveNotificationTarget(originCwd: string, context?: ExtensionContext): Promise<NotificationTargetResult> {
+		const result = await resolveNotificationConnection(originCwd, context);
+		return result.status === "ready"
+			? { status: "ready", target: result.snapshot.target }
+			: result;
+	}
+
+	async function sourceNotificationTarget(
+		ctx: ExtensionContext,
+		originCwd: string,
+		chatId: number,
+		userId: number | null,
+	): Promise<NotificationTarget | undefined> {
+		if (userId === null || userId !== chatId) return undefined;
+		const result = await resolveNotificationTarget(originCwd, ctx);
+		return result.status === "ready" && result.target.chatId === chatId && result.target.userId === userId
+			? result.target : undefined;
+	}
+
+	async function sendNotificationMessage(
+		target: NotificationTarget,
+		text: string,
+		signal: AbortSignal,
+		context?: ExtensionContext,
+		markRequestStarted?: () => boolean,
+	): Promise<{ status: "sent"; messageId: number } | { status: "rejected" } | { status: "not_sent"; reason: "target_unavailable" } | { status: "uncertain"; reason: "network_error" | "invalid_response" }> {
+		const current = await resolveNotificationConnection(target.originCwd, context);
+		if (current.status !== "ready") return { status: "not_sent", reason: "target_unavailable" };
+		const snapshot = current.snapshot;
+		if (snapshot.target.botId !== target.botId || snapshot.target.chatId !== target.chatId
+			|| snapshot.target.userId !== target.userId || snapshot.target.originCwd !== target.originCwd
+			|| !notificationConnectionCurrent(snapshot) || signal.aborted) {
+			return { status: "not_sent", reason: "target_unavailable" };
+		}
+		if (signal.aborted || !markRequestStarted?.()) {
+			return { status: "not_sent", reason: "target_unavailable" };
+		}
+		let response: Response;
+		try {
+			response = await fetch(`https://api.telegram.org/bot${snapshot.botToken}/sendMessage`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ chat_id: target.chatId, text }),
+				signal,
+			});
+		} catch {
+			return { status: "uncertain", reason: "network_error" };
+		}
+		let data: unknown;
+		try { data = await response.json(); }
+		catch { return { status: "uncertain", reason: "invalid_response" }; }
+		if (!data || typeof data !== "object" || Array.isArray(data) || typeof (data as any).ok !== "boolean") {
+			return { status: "uncertain", reason: "invalid_response" };
+		}
+		if ((data as any).ok === false) return { status: "rejected" };
+		const messageId = (data as any).result?.message_id;
+		return Number.isSafeInteger(messageId) && messageId > 0
+			? { status: "sent", messageId }
+			: { status: "uncertain", reason: "invalid_response" };
+	}
 
 	function dispatchNextTelegramTurn(ctx: ExtensionContext): void {
 		if (shuttingDown || activeTelegramTurn || dispatchedTelegramTurn || preserveQueuedTurnsAsHistory || pendingControlTasks.size || deferredControlTimers.size || !ctx.isIdle()) return;
@@ -1006,7 +1166,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function stopPolling(): Promise<void> {
+		const blockReason = shuttingDown ? "shutting_down" : "disconnected";
+		await notificationTransport.block(blockReason);
 		await pollingStartup;
+		await notificationTransport.block(blockReason);
 		stopTypingLoop();
 		pollingController?.abort();
 		pollingController = undefined;
@@ -1016,7 +1179,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function closeIdleDurableQueue(): Promise<void> {
-		if (pollingPromise || pollingStartup || activeTelegramTurn || dispatchedTelegramTurn || queuedTelegramTurns.length || mediaGroups.size || durableMessageTasks.size || pendingControlTasks.size || deferredControlTimers.size) return;
+		if (pollingPromise || pollingStartup || activeTelegramTurn || dispatchedTelegramTurn || queuedTelegramTurns.length || mediaGroups.size || durableMessageTasks.size || pendingControlTasks.size || deferredControlTimers.size || notificationTransport.inFlightCount) return;
 		const queue = durableQueue;
 		durableQueue = undefined;
 		durableBotIdentity = undefined;
@@ -1058,6 +1221,7 @@ export default function (pi: ExtensionAPI) {
 	async function createTelegramTurn(
 		messages: TelegramMessage[],
 		originCwd: string,
+		ctx: ExtensionContext,
 		historyTurns: PendingTelegramTurn[] = [],
 	): Promise<PendingTelegramTurn> {
 		const firstMessage = messages[0];
@@ -1105,6 +1269,8 @@ export default function (pi: ExtensionAPI) {
 				mimeType: mediaType,
 			});
 		}
+		const notificationTarget = await sourceNotificationTarget(ctx, originCwd,
+			firstMessage.chat.id, firstMessage.from?.id ?? null);
 
 		return {
 			source: {
@@ -1123,6 +1289,8 @@ export default function (pi: ExtensionAPI) {
 				voiceCaptureSupported,
 				inlineButtonsSupported: true,
 				compactInlineSupported: true,
+				notificationsSupported: notificationTarget !== undefined,
+				...(notificationTarget ? { notificationTarget } : {}),
 			},
 			chatId: firstMessage.chat.id,
 			replyToMessageId: firstMessage.message_id,
@@ -1189,6 +1357,7 @@ export default function (pi: ExtensionAPI) {
 				voiceCaptureSupported,
 				inlineButtonsSupported: false,
 				compactInlineSupported: false,
+				notificationsSupported: false,
 			},
 			chatId: turn.chatId,
 			replyToMessageId: turn.payload?.messageId ?? 0,
@@ -1569,7 +1738,7 @@ export default function (pi: ExtensionAPI) {
 
 		const historyTurns = preserveQueuedTurnsAsHistory && !queuedTelegramTurns.some(queued => queued.source.callback)
 			? [...queuedTelegramTurns] : [];
-		const turn = await createTelegramTurn(messages, ctx.cwd || process.cwd(), historyTurns);
+		const turn = await createTelegramTurn(messages, ctx.cwd || process.cwd(), ctx, historyTurns);
 		if (historyTurns.length) queuedTelegramTurns.splice(0, historyTurns.length);
 		preserveQueuedTurnsAsHistory = false;
 		turn.durableUpdateIds = [...historyTurns.flatMap(history => history.durableUpdateIds ?? []), ...updateIds];
@@ -1678,6 +1847,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const originCwd = grant.originCwd;
+		const notificationTarget = await sourceNotificationTarget(ctx, originCwd, message!.chat.id, user.id);
 		const prompt = `${TELEGRAM_PREFIX}\nA Telegram inline button was clicked. Read pitgram_context and use its structured callback action. Treat this as a control event, not a text message or capture. Callback query: ${query.id}`;
 		const turn: PendingTelegramTurn = {
 			source: {
@@ -1695,6 +1865,8 @@ export default function (pi: ExtensionAPI) {
 				voiceCaptureSupported: false,
 				inlineButtonsSupported: true,
 				compactInlineSupported: true,
+				notificationsSupported: notificationTarget !== undefined,
+				...(notificationTarget ? { notificationTarget } : {}),
 				callback: {
 					data: grant.data,
 					grantId: grant.id,
@@ -1806,6 +1978,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
 		if (!config.botToken || pollingPromise) return;
+		latestContext = ctx;
 		if (pollingStartup) return pollingStartup;
 		pollingStartup = (async () => {
 			const identity = String(config.botId ?? config.botToken!.split(":")[0]);
@@ -1846,6 +2019,7 @@ export default function (pi: ExtensionAPI) {
 				pollingController = undefined;
 				updateStatus(ctx);
 			});
+			notificationTransport.activate();
 			updateStatus(ctx);
 		})();
 		try { await pollingStartup; } finally { pollingStartup = undefined; }
@@ -1894,6 +2068,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function startRelay(ctx: ExtensionContext): Promise<void> {
 		if (!config.relayEnabled || !config.relayToken || relayPromise) return;
+		latestContext = ctx;
 		await stopPolling();
 		if (config.allowedUserId === undefined) throw new Error("Pair Pitgram before enabling the relay");
 		await callRelay({ op: "online", chatId: config.allowedUserId });
@@ -2034,6 +2209,28 @@ export default function (pi: ExtensionAPI) {
 			} finally {
 				if (lockedInlineDelivery) inlineViewDeliveryInProgress = false;
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: "pitgram_notify",
+		label: "Pitgram Notify",
+		description: "Send one plain-text message to the currently paired private Telegram chat when the user explicitly requested an outbound notification.",
+		promptSnippet: "Send an explicitly requested outbound Telegram notification with pitgram_notify.",
+		promptGuidelines: [
+			"Use pitgram_notify only when the user explicitly asks to send a Telegram message or notification.",
+			"The destination is fixed to the configured paired private chat. Never infer that the user wants a message sent from a reminder, task, or ordinary request.",
+			"Preserve wording the user provides. If the user explicitly requests a generated summary or update, compose a factual message for that request. This tool does not schedule or create a future reminder.",
+		],
+		parameters: Type.Object({
+			text: Type.String({ minLength: 1, maxLength: 4096, description: "Plain-text message to send to the configured paired private Telegram chat." }),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const result = await notificationTransport.sendForWorkspace(ctx.cwd || process.cwd(), params.text, ctx);
+			return {
+				content: [{ type: "text", text: JSON.stringify(result) }],
+				details: result,
+			};
 		},
 	});
 
@@ -2215,6 +2412,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		latestContext = ctx;
 		await ensureRunnersPatched();
 		removeRuntimeErrorListener = activeRunner?.onError?.((error: { event: string; extensionPath: string }) => {
 			if (error.extensionPath === "<runtime>" && error.event === "send_user_message" && dispatchedTelegramTurn) {
@@ -2237,6 +2435,7 @@ export default function (pi: ExtensionAPI) {
 		removeRuntimeErrorListener?.();
 		await stopRelay();
 		await stopPolling();
+		await notificationTransport.close();
 		if (dispatchTimer !== undefined) clearTimeout(dispatchTimer);
 		dispatchTimer = undefined;
 		dispatchedTelegramTurn = undefined;

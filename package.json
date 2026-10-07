@@ -1,6 +1,6 @@
 {
   "name": "pitgram",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "Telegram bridge for Pi with remote session management and an optional durable offline relay",
   "author": "Raghav Bali",
   "license": "MIT",
