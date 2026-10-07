@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.1
+
+- Add digest-bound private inline view references to avoid copying full keyboards through the model; retain the existing text/buttons tool input.
+- Edit the original inbox message after a callback, preserving persisted grant bindings.
+- Avoid duplicate previews and final assistant messages after successful compact view delivery; ordinary replies and errors remain visible.
+- Expose `compactInlineSupported` for capability-aware workspace routing.
+
 ## 1.5.0
 
 - Add `pitgram_inline` for bounded inline-button views during authorized direct Telegram turns.
