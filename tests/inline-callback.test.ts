@@ -149,6 +149,8 @@ test("direct inline callback is durable, authorized, serialized, and exposed onl
 		assert.equal(callbackSource.typedCaptureSupported, false);
 		assert.equal(callbackSource.voiceCaptureSupported, false);
 		assert.equal(callbackSource.userId, 42);
+		assert.equal(callbackSource.captureScopeSupported, undefined);
+		assert.equal(callbackSource.captureScope, undefined);
 	} finally {
 		await handlers.get("session_shutdown")({}, ctx);
 		globalThis.fetch = originalFetch;
