@@ -8,6 +8,8 @@ import { ExtensionRunner, SessionManager } from "@earendil-works/pi-coding-agent
 import { Type } from "typebox";
 import { DurableQueue } from "./durable-queue.js";
 import { NotificationTransport } from "./notifications.js";
+import { runCaptureSessionPreflight } from "./capture-session-preflight.js";
+import { formatTelegramHelp, TELEGRAM_MENU_COMMANDS } from "./telegram-help.js";
 let activeRunner;
 function patchExtensionRunnerClass(RunnerClass) {
     if (!RunnerClass || !RunnerClass.prototype)
@@ -309,6 +311,7 @@ export default function (pi) {
     let previewFlushPromise;
     let inlineViewDeliveryInProgress = false;
     let draftSupport = "unknown";
+    let commandMenuRegisteredBotId;
     let nextDraftId = 0;
     const mediaGroups = new Map();
     let sessionCache = [];
@@ -402,6 +405,44 @@ export default function (pi) {
         const result = await resolveNotificationTarget(originCwd, ctx);
         return result.status === "ready" && result.target.chatId === chatId && result.target.userId === userId
             ? result.target : undefined;
+    }
+    async function sourceCaptureScope(ctx, originCwd, chatId, userId) {
+        if (!config.botToken || userId === null || userId !== chatId || userId !== config.allowedUserId
+            || !Number.isSafeInteger(chatId) || chatId <= 0 || !Number.isSafeInteger(userId) || userId <= 0)
+            return undefined;
+        const tokenPrefix = config.botToken.split(":", 1)[0];
+        const botId = config.botId ?? (/^\d+$/.test(tokenPrefix) ? Number(tokenPrefix) : undefined);
+        if (!Number.isSafeInteger(botId) || (botId ?? 0) <= 0)
+            return undefined;
+        try {
+            const contextCwd = ctx.cwd || process.cwd();
+            const [canonicalOrigin, canonicalContext] = await Promise.all([realpath(originCwd), realpath(contextCwd)]);
+            if (canonicalOrigin !== canonicalContext)
+                return undefined;
+            return { botId: String(botId), chatId, userId, originCwd: canonicalOrigin };
+        }
+        catch {
+            return undefined;
+        }
+    }
+    async function registerTelegramCommandMenu(ctx) {
+        if (!config.botToken || !Number.isSafeInteger(config.allowedUserId) || (config.allowedUserId ?? 0) <= 0)
+            return;
+        const tokenPrefix = config.botToken.split(":", 1)[0];
+        const botId = config.botId ?? (/^\d+$/.test(tokenPrefix) ? Number(tokenPrefix) : undefined);
+        if (!Number.isSafeInteger(botId) || (botId ?? 0) <= 0)
+            return;
+        const identity = String(botId);
+        if (commandMenuRegisteredBotId === identity)
+            return;
+        try {
+            await callTelegram("setMyCommands", { commands: TELEGRAM_MENU_COMMANDS }, { signal: AbortSignal.timeout(5000) });
+            commandMenuRegisteredBotId = identity;
+        }
+        catch {
+            // The menu is a convenience; polling and explicit /help stay available.
+            ctx.ui.notify("Could not refresh Telegram's command menu. Use /help to see commands.", "warning");
+        }
     }
     async function sendNotificationMessage(target, text, signal, context, markRequestStarted) {
         const current = await resolveNotificationConnection(target.originCwd, context);
@@ -956,6 +997,7 @@ export default function (pi) {
         const firstMessage = messages[0];
         if (!firstMessage)
             throw new Error("Missing Telegram message for turn creation");
+        const canonicalOriginCwd = await realpath(originCwd).catch(() => originCwd);
         const rawText = messages.map((message) => (message.text || message.caption || "").trim()).filter(Boolean).join("\n\n");
         const files = await buildTelegramFiles(messages);
         const voiceMessage = messages.length === 1 ? firstMessage : undefined;
@@ -1006,7 +1048,8 @@ export default function (pi) {
                 mimeType: mediaType,
             });
         }
-        const notificationTarget = await sourceNotificationTarget(ctx, originCwd, firstMessage.chat.id, firstMessage.from?.id ?? null);
+        const notificationTarget = await sourceNotificationTarget(ctx, canonicalOriginCwd, firstMessage.chat.id, firstMessage.from?.id ?? null);
+        const captureScope = await sourceCaptureScope(ctx, canonicalOriginCwd, firstMessage.chat.id, firstMessage.from?.id ?? null);
         return {
             source: {
                 kind: "telegram",
@@ -1016,7 +1059,7 @@ export default function (pi) {
                 userId: firstMessage.from?.id ?? null,
                 messageId: firstMessage.message_id,
                 relayTurnId: null,
-                originCwd,
+                originCwd: canonicalOriginCwd,
                 timestamp: firstMessage.date ?? null,
                 attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: voiceCaptureSupported ? "audio/ogg" : imageCaptureSupported ? (file.mimeType ?? "").toLowerCase() : file.mimeType ?? null, temporary: true,
                     ...(voiceCaptureSupported ? { mediaKind: "voice", durationSeconds: voiceMessage?.voice?.duration ?? null } : imageCaptureSupported ? { mediaKind: "image" } : {}) })),
@@ -1027,6 +1070,7 @@ export default function (pi) {
                 compactInlineSupported: true,
                 notificationsSupported: notificationTarget !== undefined,
                 ...(notificationTarget ? { notificationTarget } : {}),
+                ...(captureScope ? { captureScopeSupported: true, captureScope } : {}),
             },
             chatId: firstMessage.chat.id,
             replyToMessageId: firstMessage.message_id,
@@ -1482,10 +1526,11 @@ export default function (pi) {
             return;
         }
         if (lower === "/help" || lower === "/start") {
-            await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Send me a message and I will forward it to pi. Commands:\n- /status: show usage metrics\n- /compact: compact session history\n- /sessions: list sessions in this directory\n- /switch <index|path|id>: switch active session\n- /new [name]: start a new session\n- /fork: fork active session\n- /model [index|name]: show or switch LLM model\n- /thinking [level]: show or set reasoning level\n- /settings: show current session settings\n- stop: abort current turn`);
+            await sendTextReply(firstMessage.chat.id, firstMessage.message_id, formatTelegramHelp());
             if (config.allowedUserId === undefined && firstMessage.from) {
                 config.allowedUserId = firstMessage.from.id;
                 await writeConfig(config);
+                await registerTelegramCommandMenu(ctx);
                 updateStatus(ctx);
             }
             return;
@@ -1493,6 +1538,13 @@ export default function (pi) {
         const historyTurns = preserveQueuedTurnsAsHistory && !queuedTelegramTurns.some(queued => queued.source.callback)
             ? [...queuedTelegramTurns] : [];
         const turn = await createTelegramTurn(messages, ctx.cwd || process.cwd(), ctx, historyTurns);
+        if (turn.source.delivery === "direct") {
+            const preflight = await runCaptureSessionPreflight(turn.source.originCwd, turn.source);
+            if (preflight.status === "handled") {
+                await sendTextReply(turn.chatId, turn.replyToMessageId, preflight.message);
+                return;
+            }
+        }
         if (historyTurns.length)
             queuedTelegramTurns.splice(0, historyTurns.length);
         preserveQueuedTurnsAsHistory = false;
@@ -1661,6 +1713,7 @@ export default function (pi) {
         if (config.allowedUserId === undefined) {
             config.allowedUserId = message.from.id;
             await writeConfig(config);
+            await registerTelegramCommandMenu(ctx);
             updateStatus(ctx);
             await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
         }
@@ -1779,6 +1832,7 @@ export default function (pi) {
                 durableBotIdentity = undefined;
                 return;
             }
+            await registerTelegramCommandMenu(ctx);
             pollingController = new AbortController();
             pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
                 pollingPromise = undefined;
@@ -2236,11 +2290,12 @@ export default function (pi) {
     pi.on("before_agent_start", async (event) => {
         // Match the actual dispatched prompt, never the [telegram] prefix alone.
         // A queued turn must not be assigned to an unrelated local agent run.
+        const userPrompt = event.messageType === "custom" ? "" : event.prompt;
         matchedTelegramTurn = dispatchedTelegramTurn === queuedTelegramTurns[0]
             && dispatchedTelegramTurn?.content[0]?.type === "text"
-            && event.prompt === dispatchedTelegramTurn.content[0].text
+            && userPrompt === dispatchedTelegramTurn.content[0].text
             ? dispatchedTelegramTurn : undefined;
-        const suffix = isTelegramPrompt(event.prompt)
+        const suffix = isTelegramPrompt(userPrompt)
             ? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
             : SYSTEM_PROMPT_SUFFIX;
         return {

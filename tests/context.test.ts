@@ -1,21 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, realpath, symlink, writeFile, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { voiceMetadata } from "../relay/lib/voice_metadata.js";
 import { collectFileIds, minimalMessage } from "../relay/lib/telegram_message.js";
+import { formatTelegramHelp, TELEGRAM_COMMANDS, TELEGRAM_MENU_COMMANDS } from "../src/telegram-help.ts";
+import { runCaptureSessionPreflight } from "../src/capture-session-preflight.ts";
 
 const testHome = await mkdtemp(join(tmpdir(), "pitgram-context-"));
 const previousHome = process.env.HOME;
 process.env.HOME = testHome;
 const { default: pitgram } = await import("../dist/index.js");
 
-function register() {
+function register(cwd = process.cwd()) {
   const handlers = new Map<string, any>();
   const tools = new Map<string, any>();
   const sent: any[] = [];
+  const notifications: any[] = [];
   const pi: any = {
     on: (name: string, handler: any) => handlers.set(name, handler),
     registerTool: (tool: any) => tools.set(tool.name, tool),
@@ -26,9 +29,10 @@ function register() {
   let idle = true;
   const ctx: any = {
     mode: "tui",
+    cwd,
     isIdle: () => idle,
     abort: () => {},
-    ui: { setStatus: () => {}, theme: { fg: (_name: string, value: string) => value } },
+    ui: { setStatus: () => {}, notify: (...args: any[]) => notifications.push(args), theme: { fg: (_name: string, value: string) => value } },
   };
   const context = async () => (await tools.get("pitgram_context").execute("test", {})).details;
   const start = async (prompt: string) => {
@@ -41,20 +45,20 @@ function register() {
     idle = true;
     await handlers.get("agent_settled")({}, ctx);
   };
-  return { handlers, sent, ctx, context, start, end, setIdle: (value: boolean) => { idle = value; } };
+  return { handlers, sent, notifications, ctx, context, start, end, setIdle: (value: boolean) => { idle = value; } };
 }
 
 function fakeResponse(result: unknown) {
   return { ok: true, json: async () => ({ ok: true, result }) } as Response;
 }
 
-async function fixture(config: Record<string, unknown>, fetchMock: typeof fetch, recover = false) {
+async function fixture(config: Record<string, unknown>, fetchMock: typeof fetch, recover = false, cwd = process.cwd()) {
   if (!recover) await rm(join(testHome, ".pi", "agent", "pitgram"), { recursive: true, force: true });
   await mkdir(join(testHome, ".pi", "agent"), { recursive: true });
   await writeFile(join(testHome, ".pi", "agent", "telegram.json"), JSON.stringify(config));
   const originalFetch = globalThis.fetch;
   globalThis.fetch = fetchMock;
-  const app = register();
+  const app = register(cwd);
   try {
     await app.handlers.get("session_start")({}, app.ctx);
     return { ...app, async close() {
@@ -68,9 +72,9 @@ async function fixture(config: Record<string, unknown>, fetchMock: typeof fetch,
   }
 }
 
-async function eventually(predicate: () => boolean) {
+async function eventually(predicate: () => boolean | Promise<boolean>) {
   for (let i = 0; i < 200; i++) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.fail("Timed out waiting for mocked turn dispatch");
@@ -82,8 +86,13 @@ test("direct turn preserves untrimmed text, isolates history and refuses local p
     { update_id: 2, message: { message_id: 102, date: 1700000001, chat: { id: 42, type: "private" }, from: { id: 42 }, text: "idea: second" } },
   ];
   let wake: (() => void) | undefined;
+  let menuCommands: unknown;
   const fetchMock = async (url: string, init?: RequestInit) => {
     const method = url.split("/").pop();
+    if (method === "setMyCommands") {
+      menuCommands = JSON.parse(String(init?.body)).commands;
+      return fakeResponse(true);
+    }
     if (method === "getUpdates") {
       if (updates.length) return fakeResponse([updates.shift()]);
       await new Promise<void>((resolve) => {
@@ -96,7 +105,7 @@ test("direct turn preserves untrimmed text, isolates history and refuses local p
     if (method === "sendMessage" || method === "sendMessageDraft") return fakeResponse({ message_id: 500 });
     throw Error("Unexpected network call: " + url);
   };
-  const app = await fixture({ botToken: "TEST_TOKEN", allowedUserId: 42, lastUpdateId: 0 }, fetchMock as typeof fetch);
+  const app = await fixture({ botToken: "17:TEST_TOKEN", allowedUserId: 42, lastUpdateId: 0 }, fetchMock as typeof fetch);
   try {
     await eventually(() => app.sent.length >= 1);
     assert.deepEqual(await app.context(), { version: 1, available: false, source: null });
@@ -117,6 +126,19 @@ test("direct turn preserves untrimmed text, isolates history and refuses local p
     assert.equal(first.source.relayTurnId, null);
     assert.equal(first.source.typedCaptureSupported, true);
     assert.equal(first.source.voiceCaptureSupported, false);
+    assert.equal(first.source.captureScopeSupported, true);
+    assert.deepEqual(first.source.captureScope, {
+      botId: "17", chatId: 42, userId: 42, originCwd: first.source.originCwd,
+    });
+    assert.deepEqual(menuCommands, TELEGRAM_MENU_COMMANDS);
+    assert.ok(TELEGRAM_MENU_COMMANDS.length <= 100);
+    assert.match(formatTelegramHelp(), /\/session \[label\] \[tags\]/);
+    assert.match(formatTelegramHelp(), /\/sessions still lists Pi conversation history/);
+    for (const command of TELEGRAM_COMMANDS) assert.ok(formatTelegramHelp().includes(command.help));
+    for (const command of TELEGRAM_MENU_COMMANDS) {
+      assert.match(command.command, /^[a-z0-9_]{1,32}$/);
+      assert.ok(command.description.length >= 1 && command.description.length <= 256);
+    }
     await eventually(() => updates.length === 0);
     await app.end();
     assert.equal((await app.context()).available, false);
@@ -129,6 +151,81 @@ test("direct turn preserves untrimmed text, isolates history and refuses local p
   } finally {
     await app.close();
     wake?.();
+  }
+});
+
+test("workspace capture-session helper handles the original direct source before Pi dispatch", async () => {
+  const temporaryWorkspace = await mkdtemp(join(tmpdir(), "pitgram-session-gate-"));
+  const workspace = await realpath(temporaryWorkspace);
+  const workspaceAlias = `${temporaryWorkspace}-alias`;
+  await symlink(workspace, workspaceAlias, "dir");
+  const toolsDirectory = join(workspace, "tools");
+  const markerPath = join(workspace, "helper-input.json");
+  await mkdir(toolsDirectory);
+  const referenceRoot = process.env.PIBOT_CAPTURE_SESSION_SOURCE_ROOT;
+  if (referenceRoot) {
+    await cp(join(referenceRoot, "tools", "capture_session.py"), join(toolsDirectory, "capture_session.py"));
+    await cp(join(referenceRoot, "pibot"), join(workspace, "pibot"), { recursive: true });
+  } else {
+    await writeFile(join(toolsDirectory, "capture_session.py"), [
+      "import json, sys",
+      `open(${JSON.stringify(markerPath)}, "w").write(json.dumps(json.load(sys.stdin)))`,
+      'print(json.dumps({"status":"handled","message":"Saved in the active capture."}))',
+      "",
+    ].join("\n"));
+    assert.deepEqual(await runCaptureSessionPreflight(workspace, { text: "direct probe" }), {
+      status: "handled", message: "Saved in the active capture.",
+    });
+    await rm(markerPath, { force: true });
+  }
+  let updatePending = true;
+  const replies: string[] = [];
+  const fetchMock = async (url: string, init?: RequestInit) => {
+    const method = url.split("/").pop();
+    if (method === "setMyCommands") return fakeResponse(true);
+    if (method === "getUpdates") {
+      if (updatePending) {
+        updatePending = false;
+        return fakeResponse([{ update_id: 11, message: {
+          message_id: 201, date: 1700000000, chat: { id: 42, type: "private" },
+          from: { id: 42 }, text: "/session launch #planning",
+        } }]);
+      }
+      await new Promise<void>((resolve) => init?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+      return fakeResponse([]);
+    }
+    if (method === "deleteWebhook") return fakeResponse(true);
+    if (method === "sendMessage") {
+      replies.push(JSON.parse(String(init?.body)).text);
+      return fakeResponse({ message_id: 900 });
+    }
+    throw Error("Unexpected network call: " + url);
+  };
+  const app = await fixture({ botToken: "31:TEST_TOKEN", allowedUserId: 42 }, fetchMock as typeof fetch, false, workspaceAlias);
+  try {
+    if (!referenceRoot) {
+      await eventually(async () => {
+        try { await readFile(markerPath); return true; }
+        catch { return false; }
+      });
+      const envelope = JSON.parse(await readFile(markerPath, "utf8"));
+      assert.deepEqual(Object.keys(envelope).sort(), ["available", "source", "version"]);
+      assert.equal(envelope.version, 1);
+      assert.equal(envelope.available, true);
+      assert.equal(envelope.source.text, "/session launch #planning");
+      assert.equal(envelope.source.originCwd, workspace);
+      assert.deepEqual(envelope.source.captureScope, {
+        botId: "31", chatId: 42, userId: 42, originCwd: workspace,
+      });
+    }
+    await eventually(() => replies.length === 1);
+    if (referenceRoot) assert.match(replies[0], /^Capture session started:/);
+    else assert.deepEqual(replies, ["Saved in the active capture."]);
+    assert.equal(app.sent.length, 0, "handled controls must not reach the Pi model");
+  } finally {
+    await app.close();
+    await rm(temporaryWorkspace, { recursive: true, force: true });
+    await rm(workspaceAlias, { force: true });
   }
 });
 
@@ -165,8 +262,38 @@ test("relay uses edited delivered text and a stable relay fallback when message 
     assert.equal(source.relayTurnId, 77);
     assert.equal(source.timestamp, 1700000002);
     assert.equal(source.typedCaptureSupported, true);
+    assert.equal(source.captureScopeSupported, undefined);
+    assert.equal(source.captureScope, undefined);
     await app.end();
     assert.equal((await app.context()).available, false);
+  } finally {
+    await app.close();
+  }
+});
+
+test("Telegram command-menu timeout warns without preventing polling", async () => {
+  let pollingStarted = false;
+  const fetchMock = async (url: string, init?: RequestInit) => {
+    const method = url.split("/").pop();
+    if (method === "setMyCommands") {
+      return await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) return reject(new Error("missing menu timeout signal"));
+        signal.addEventListener("abort", () => reject(new DOMException("Timed out", "AbortError")), { once: true });
+      });
+    }
+    if (method === "deleteWebhook") return fakeResponse(true);
+    if (method === "getUpdates") {
+      pollingStarted = true;
+      await new Promise<void>((resolve) => init?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+      return fakeResponse([]);
+    }
+    throw Error("Unexpected network call: " + url);
+  };
+  const app = await fixture({ botToken: "29:TEST_TOKEN", allowedUserId: 42, lastUpdateId: 0 }, fetchMock as typeof fetch);
+  try {
+    await eventually(() => pollingStarted);
+    assert.equal(app.notifications.some(([message]) => String(message).includes("Use /help")), true);
   } finally {
     await app.close();
   }
