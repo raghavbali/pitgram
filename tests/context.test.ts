@@ -226,6 +226,56 @@ test("direct voice context is limited to one eligible voice note", async () => {
   }
 });
 
+test("direct image context marks only one supported current photo or document", async () => {
+  const cases: Array<[Record<string, any>, boolean]> = [
+    [{ photo: [{ file_id: "p", width: 10, height: 10 }], caption: "caption" }, true],
+    [{ photo: [{ file_id: "p", width: 10, height: 10 }], caption: "/capture remember this" }, true],
+    [{ photo: [{ file_id: "p", width: 10, height: 10 }] }, true],
+    [{ document: { file_id: "d", mime_type: "image/jpeg", file_name: "x.jpg" } }, true],
+    [{ document: { file_id: "d", mime_type: "image/png", file_name: "x.png" }, caption: "/capture" }, true],
+    [{ document: { file_id: "d", mime_type: "IMAGE/WEBP", file_name: "x.webp" } }, true],
+    [{ document: { file_id: "d", mime_type: "image/gif", file_name: "x.jpg" } }, false],
+    [{ document: { file_id: "d", mime_type: "application/octet-stream", file_name: "x.png" } }, false],
+    [{ photo: [{ file_id: "p", width: 10, height: 10 }], media_group_id: "album" }, false],
+    [{ photo: [{ file_id: "p", width: 10, height: 10 }], video: { file_id: "v" } }, false],
+    [{ photo: [{ file_id: "p", width: 10, height: 10 }], text: "mixed" }, false],
+  ];
+  for (const [media, expected] of cases) {
+    let dispatched = false;
+    const fetchMock = async (url: string, init?: RequestInit) => {
+      const method = url.split("/").pop();
+      if (method === "getUpdates") {
+        if (!dispatched) {
+          dispatched = true;
+          return fakeResponse([{ update_id: 1, message: { message_id: 101, date: 1700000000,
+            chat: { id: 42, type: "private" }, from: { id: 42 }, ...media } }]);
+        }
+        await new Promise<void>((resolve) => init?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+        return fakeResponse([]);
+      }
+      if (method === "getFile") return fakeResponse({ file_path: "fixture" });
+      if (url.includes("/file/bot")) return new Response("image fixture");
+      if (method === "deleteWebhook" || method === "sendChatAction") return fakeResponse(true);
+      if (method === "sendMessage" || method === "sendMessageDraft") return fakeResponse({ message_id: 500 });
+      throw Error("Unexpected fixture network call");
+    };
+    const app = await fixture({ botToken: "TEST_TOKEN", allowedUserId: 42, lastUpdateId: 0 }, fetchMock as typeof fetch);
+    try {
+      await eventually(() => app.sent.length > 0);
+      await app.start(app.sent[0][0].text);
+      const source = (await app.context()).source;
+      assert.equal(source.imageCaptureSupported, expected ? true : undefined);
+      assert.equal(source.attachments[0].mediaKind, expected ? "image" : undefined);
+      if (expected) assert.equal(source.attachments[0].mimeType, String(media.document?.mime_type ?? "image/jpeg").toLowerCase());
+      assert.equal(source.voiceCaptureSupported, false);
+      if (media.caption !== undefined) assert.equal(source.text, media.caption);
+      await app.end();
+    } finally {
+      await app.close();
+    }
+  }
+});
+
 test("relay preserves actual message identity and refuses flagged media without downloads", async () => {
   for (const hasMedia of [false, true]) {
     let claimed = false;

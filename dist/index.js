@@ -966,6 +966,14 @@ export default function (pi) {
             && !voiceMessage.animation && !voiceMessage.sticker && files.length === 1 && files[0].isImage === false ? files[0] : undefined;
         const voiceMimeType = voiceMessage?.voice?.mime_type ?? "audio/ogg";
         const voiceCaptureSupported = Boolean(voiceFile && voiceMimeType === "audio/ogg");
+        const imageMessage = messages.length === 1 ? firstMessage : undefined;
+        const imageFile = imageMessage && !imageMessage.media_group_id && !imageMessage.text
+            && !imageMessage.video && !imageMessage.audio && !imageMessage.voice && !imageMessage.animation && !imageMessage.sticker
+            && ((Array.isArray(imageMessage.photo) && imageMessage.photo.length > 0 && !imageMessage.document)
+                || (!imageMessage.photo && imageMessage.document && ["image/jpeg", "image/png", "image/webp"].includes((imageMessage.document.mime_type ?? "").toLowerCase())))
+            && files.length === 1 && files[0].isImage && ["image/jpeg", "image/png", "image/webp"].includes((files[0].mimeType ?? "").toLowerCase())
+            ? files[0] : undefined;
+        const imageCaptureSupported = Boolean(imageFile);
         const content = [];
         let prompt = `${TELEGRAM_PREFIX}`;
         if (historyTurns.length > 0) {
@@ -1010,10 +1018,11 @@ export default function (pi) {
                 relayTurnId: null,
                 originCwd,
                 timestamp: firstMessage.date ?? null,
-                attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: voiceCaptureSupported ? "audio/ogg" : file.mimeType ?? null, temporary: true,
-                    ...(voiceCaptureSupported ? { mediaKind: "voice", durationSeconds: voiceMessage?.voice?.duration ?? null } : {}) })),
+                attachments: files.map((file) => ({ path: file.path, fileName: file.fileName, mimeType: voiceCaptureSupported ? "audio/ogg" : imageCaptureSupported ? (file.mimeType ?? "").toLowerCase() : file.mimeType ?? null, temporary: true,
+                    ...(voiceCaptureSupported ? { mediaKind: "voice", durationSeconds: voiceMessage?.voice?.duration ?? null } : imageCaptureSupported ? { mediaKind: "image" } : {}) })),
                 typedCaptureSupported: messages.length === 1 && firstMessage.text !== undefined && files.length === 0,
                 voiceCaptureSupported,
+                ...(imageCaptureSupported ? { imageCaptureSupported: true } : {}),
                 inlineButtonsSupported: true,
                 compactInlineSupported: true,
                 notificationsSupported: notificationTarget !== undefined,
